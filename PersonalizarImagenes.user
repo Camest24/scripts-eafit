@@ -1,0 +1,513 @@
+    // ==UserScript==
+    // @name         EAFIT D2L - Personalizar imágenes de materias
+    // @namespace    http://tampermonkey.net/
+    // @version      1.0.0
+    // @description  Deja cambiar la imagen de cada tarjeta de curso en "Mis cursos", pegando un link o subiendo una foto de tu PC. Se guarda por materia en este navegador.
+    // @author       You
+    // @match        https://interactivavirtual.eafit.edu.co/*
+    // @grant        none
+    // @run-at       document-idle
+    // ==/UserScript==
+
+    (function () {
+      'use strict';
+
+      console.log('[EAFIT imágenes] script iniciado');
+
+      const STORAGE_PREFIX = 'eafit-course-img::';
+      const MAX_DIMENSION = 640; // subimos las fotos de PC a esta resolución máxima antes de guardarlas
+      const JPEG_QUALITY = 0.82;
+
+      // mismo helper que usan los demás scripts EAFIT — varios widgets de D2L viven
+      // adentro de Shadow DOM (Lit / @brightspace-ui), querySelectorAll normal no los ve
+      function deepQueryAll(root, selector) {
+        const results = [];
+        const stack = [root];
+        while (stack.length) {
+          const node = stack.pop();
+          if (!node || !node.querySelectorAll) continue;
+          results.push(...node.querySelectorAll(selector));
+          node.querySelectorAll('*').forEach((el) => {
+            if (el.shadowRoot) stack.push(el.shadowRoot);
+          });
+        }
+        return results;
+      }
+
+      // no todas las tarjetas de curso usan un <img> real para la foto — los logs
+      // mostraron que en esta instancia de D2L el logo sí es <img>, pero las fotos de
+      // las tarjetas de "Mis cursos" NO aparecían como <img> en absoluto. Lo más probable
+      // es que D2L las pinte como background-image de un <div>/custom-element. Estos
+      // helpers tratan ambos casos ("superficie de imagen") de forma uniforme.
+      function isImgTag(el) {
+        return el.tagName === 'IMG';
+      }
+      function getElementBackgroundImageUrl(el) {
+        const bg = getComputedStyle(el).backgroundImage;
+        if (!bg || bg === 'none') return null;
+        const m = bg.match(/url\(["']?(.*?)["']?\)/);
+        return m ? m[1] : null;
+      }
+      function getSurfaceUrl(el) {
+        return isImgTag(el) ? (el.src || '') : (getElementBackgroundImageUrl(el) || '');
+      }
+      function setSurfaceUrl(el, url) {
+        if (isImgTag(el)) {
+          el.src = url;
+        } else {
+          el.style.setProperty('background-image', `url("${url}")`, 'important');
+        }
+      }
+
+      // ---------- almacenamiento ----------
+
+      function getCustomImage(courseId) {
+        try {
+          return localStorage.getItem(STORAGE_PREFIX + courseId);
+        } catch (e) {
+          console.error('[EAFIT imágenes] no se pudo leer localStorage:', e);
+          return null;
+        }
+      }
+      // localStorage tiene cuota limitada (~5-10MB) compartida con otros scripts EAFIT
+      // (colores del calendario, etc.) — si se llena, setItem tira QuotaExceededError.
+      // Lo dejamos explotar hacia arriba (con log claro) para que el caller pueda avisarle
+      // al usuario en vez de fallar en silencio.
+      function setCustomImage(courseId, dataUrlOrLink) {
+        try {
+          localStorage.setItem(STORAGE_PREFIX + courseId, dataUrlOrLink);
+          console.log('[EAFIT imágenes] imagen guardada para curso:', courseId, '| tamaño aprox (KB):', Math.round(dataUrlOrLink.length / 1024));
+        } catch (e) {
+          console.error('[EAFIT imágenes] ERROR guardando imagen en localStorage (posible cuota llena) para curso:', courseId, e);
+          throw e;
+        }
+      }
+      function removeCustomImage(courseId) {
+        try {
+          localStorage.removeItem(STORAGE_PREFIX + courseId);
+          console.log('[EAFIT imágenes] imagen personalizada eliminada para curso:', courseId);
+        } catch (e) {
+          console.error('[EAFIT imágenes] no se pudo eliminar la imagen de localStorage para curso:', courseId, e);
+        }
+      }
+
+      // reduce la foto subida a una resolución razonable antes de guardarla en
+      // localStorage — sin esto, dos o tres fotos de celular (varios MB cada una)
+      // agotan la cuota de localStorage del dominio (~5-10MB) y rompen otros scripts
+      // que también guardan datos ahí (colores del calendario, etc.)
+      function downscaleImageFile(file) {
+        console.log('[EAFIT imágenes] procesando archivo:', file.name, '| tipo:', file.type, '| tamaño (KB):', Math.round(file.size / 1024));
+        return new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onerror = () => {
+            console.error('[EAFIT imágenes] error leyendo el archivo con FileReader:', reader.error);
+            reject(reader.error);
+          };
+          reader.onload = () => {
+            const img = new Image();
+            img.onerror = (ev) => {
+              console.error('[EAFIT imágenes] la imagen no cargó (¿archivo corrupto o no es una imagen?):', ev);
+              reject(new Error('No se pudo leer la imagen'));
+            };
+            img.onload = () => {
+              let { width, height } = img;
+              const originalDims = `${width}x${height}`;
+              if (width > height && width > MAX_DIMENSION) {
+                height = Math.round((height * MAX_DIMENSION) / width);
+                width = MAX_DIMENSION;
+              } else if (height > MAX_DIMENSION) {
+                width = Math.round((width * MAX_DIMENSION) / height);
+                height = MAX_DIMENSION;
+              }
+              try {
+                const canvas = document.createElement('canvas');
+                canvas.width = width;
+                canvas.height = height;
+                canvas.getContext('2d').drawImage(img, 0, 0, width, height);
+                const dataUrl = canvas.toDataURL('image/jpeg', JPEG_QUALITY);
+                console.log(`[EAFIT imágenes] imagen redimensionada de ${originalDims} a ${width}x${height} | tamaño final (KB):`, Math.round(dataUrl.length / 1024));
+                resolve(dataUrl);
+              } catch (e) {
+                console.error('[EAFIT imágenes] error dibujando/convirtiendo la imagen en canvas:', e);
+                reject(e);
+              }
+            };
+            img.src = reader.result;
+          };
+          reader.readAsDataURL(file);
+        });
+      }
+
+      // ---------- identificar a qué materia pertenece una tarjeta ----------
+
+      // sube por los padres CRUZANDO shadow DOM (igual que en los otros scripts EAFIT)
+      function getParentAcrossShadow(node) {
+        if (node.parentElement) return node.parentElement;
+        const root = node.getRootNode();
+        if (root && root.host) return root.host;
+        return null;
+      }
+
+      // no todas las tarjetas de curso están envueltas en un <a href="/d2l/home/...">
+      // (parece que en esta instancia de D2L no lo están) — en vez de depender de
+      // eso, subimos desde la imagen hasta encontrar un contenedor de tamaño
+      // "tarjeta" (ni gigante ni diminuto), que es la tarjeta completa del curso
+      function findCardContainer(img) {
+        let node = getParentAcrossShadow(img);
+        for (let i = 0; i < 8 && node; i++) {
+          const rect = node.getBoundingClientRect();
+          if (rect.width > 140 && rect.width < 600 && rect.height > 140) return node;
+          node = getParentAcrossShadow(node);
+        }
+        return img.parentElement || img;
+      }
+
+      // saca un identificador estable por materia leyendo el código del curso
+      // (ej. "S2666-0301") del texto de la tarjeta — no depende del orgUnitId de
+      // la URL, así que funciona exista o no el <a href="/d2l/home/...">
+      function extractCourseKey(cardContainer) {
+        const text = (cardContainer.textContent || '').trim();
+        const m = text.match(/[A-Z]{1,3}\d{3,4}-[A-Z0-9]+(-\d+)?/);
+        if (m) return m[0];
+        return text ? text.slice(0, 60).replace(/\s+/g, ' ') : null;
+      }
+
+      // ---------- popup para elegir la nueva imagen ----------
+
+      function openImagePicker(courseId, courseName, img) {
+        console.log('[EAFIT imágenes] abriendo selector de imagen para curso:', courseId);
+        const old = document.getElementById('eafit-course-img-modal');
+        if (old) old.remove();
+
+        const overlay = document.createElement('div');
+        overlay.id = 'eafit-course-img-modal';
+        Object.assign(overlay.style, {
+          position: 'fixed', inset: '0', background: 'rgba(0,0,0,.45)', zIndex: 999999,
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          fontFamily: 'Arial, sans-serif',
+        });
+        overlay.addEventListener('click', (e) => {
+          if (e.target === overlay) overlay.remove();
+        });
+
+        const box = document.createElement('div');
+        Object.assign(box.style, {
+          background: '#fff', borderRadius: '12px', padding: '20px', width: '300px',
+          boxShadow: '0 10px 40px rgba(0,0,0,.3)', position: 'relative',
+        });
+        overlay.appendChild(box);
+
+        const closeBtn = document.createElement('button');
+        closeBtn.textContent = '✕';
+        closeBtn.title = 'Cerrar';
+        Object.assign(closeBtn.style, {
+          position: 'absolute', top: '10px', right: '10px', border: 'none', background: 'transparent',
+          fontSize: '16px', cursor: 'pointer', color: '#666', lineHeight: '1',
+        });
+        closeBtn.addEventListener('click', () => overlay.remove());
+        box.appendChild(closeBtn);
+
+        const title = document.createElement('div');
+        title.textContent = 'Cambiar imagen del curso';
+        Object.assign(title.style, { fontWeight: '700', marginBottom: '2px', fontSize: '14px', color: '#111', paddingRight: '20px' });
+        box.appendChild(title);
+
+        if (courseName) {
+          const subtitle = document.createElement('div');
+          subtitle.textContent = courseName;
+          Object.assign(subtitle.style, { fontSize: '12px', color: '#666', marginBottom: '14px' });
+          box.appendChild(subtitle);
+        } else {
+          title.style.marginBottom = '14px';
+        }
+
+        const status = document.createElement('div');
+        Object.assign(status.style, { fontSize: '12px', color: '#c0392b', marginBottom: '8px', minHeight: '0' });
+        box.appendChild(status);
+
+        function setStatus(msg) {
+          status.textContent = msg || '';
+        }
+
+        function applyAndClose(dataUrlOrLink) {
+          try {
+            setCustomImage(courseId, dataUrlOrLink);
+          } catch (e) {
+            // setCustomImage ya loggeó el error con detalle; acá solo avisamos al usuario
+            // en el popup y NO cerramos, para que pueda reintentar (ej. con un link en vez
+            // de una foto, que pesa mucho menos en localStorage).
+            setStatus('No se pudo guardar la imagen (¿localStorage lleno?). Probá con un link en vez de una foto.');
+            return;
+          }
+          setSurfaceUrl(img, dataUrlOrLink);
+          console.log('[EAFIT imágenes] imagen aplicada en la tarjeta para curso:', courseId);
+          overlay.remove();
+        }
+
+        // --- opción 1: link ---
+        const urlLabel = document.createElement('div');
+        urlLabel.textContent = 'Pegar un link de imagen';
+        Object.assign(urlLabel.style, { fontSize: '12px', color: '#333', marginBottom: '4px' });
+        box.appendChild(urlLabel);
+
+        const urlRow = document.createElement('div');
+        Object.assign(urlRow.style, { display: 'flex', gap: '6px', marginBottom: '14px' });
+        box.appendChild(urlRow);
+
+        const urlInput = document.createElement('input');
+        urlInput.type = 'text';
+        urlInput.placeholder = 'https://...';
+        Object.assign(urlInput.style, {
+          flex: '1', minWidth: '0', padding: '8px', border: '1px solid #ccc',
+          borderRadius: '6px', boxSizing: 'border-box', fontSize: '13px', color: '#111',
+        });
+        urlRow.appendChild(urlInput);
+
+        const urlBtn = document.createElement('button');
+        urlBtn.textContent = 'Usar';
+        Object.assign(urlBtn.style, {
+          padding: '8px 12px', border: 'none', borderRadius: '6px', background: '#0a84ff',
+          color: '#fff', fontSize: '13px', cursor: 'pointer', flexShrink: '0',
+        });
+        urlBtn.addEventListener('click', () => {
+          const link = urlInput.value.trim();
+          if (!link) {
+            setStatus('Pegá un link primero.');
+            return;
+          }
+          applyAndClose(link);
+        });
+        urlRow.appendChild(urlBtn);
+
+        // --- separador ---
+        const sep = document.createElement('div');
+        sep.textContent = 'o';
+        Object.assign(sep.style, { textAlign: 'center', color: '#999', fontSize: '12px', marginBottom: '10px' });
+        box.appendChild(sep);
+
+        // --- opción 2: subir de PC ---
+        const fileLabel = document.createElement('label');
+        Object.assign(fileLabel.style, {
+          display: 'block', textAlign: 'center', padding: '9px', border: '1px dashed #ccc',
+          borderRadius: '6px', fontSize: '13px', color: '#333', cursor: 'pointer', marginBottom: '10px',
+        });
+        fileLabel.textContent = 'Subir foto de mi PC';
+        const fileInput = document.createElement('input');
+        fileInput.type = 'file';
+        fileInput.accept = 'image/*';
+        fileInput.style.display = 'none';
+        fileLabel.appendChild(fileInput);
+        box.appendChild(fileLabel);
+
+        fileInput.addEventListener('change', async () => {
+          const file = fileInput.files && fileInput.files[0];
+          if (!file) return;
+          setStatus('Procesando imagen...');
+          try {
+            const dataUrl = await downscaleImageFile(file);
+            applyAndClose(dataUrl);
+          } catch (e) {
+            console.warn('[EAFIT imágenes] no se pudo procesar el archivo:', e);
+            setStatus('No se pudo leer esa imagen, probá con otra.');
+          }
+        });
+
+        // --- quitar personalización ---
+        if (getCustomImage(courseId)) {
+          const removeBtn = document.createElement('button');
+          removeBtn.textContent = 'Quitar imagen personalizada';
+          Object.assign(removeBtn.style, {
+            width: '100%', padding: '8px', border: 'none', borderRadius: '6px', background: 'transparent',
+            color: '#c0392b', fontSize: '12px', cursor: 'pointer',
+          });
+          removeBtn.addEventListener('click', () => {
+            removeCustomImage(courseId);
+            const original = img.dataset.eafitOriginalUrl;
+            if (original) {
+              setSurfaceUrl(img, original);
+              console.log('[EAFIT imágenes] imagen restaurada a la original de D2L para curso:', courseId);
+            } else {
+              console.warn('[EAFIT imágenes] no había una url original guardada para restaurar, curso:', courseId);
+            }
+            overlay.remove();
+          });
+          box.appendChild(removeBtn);
+        }
+
+        document.body.appendChild(overlay);
+        urlInput.focus();
+      }
+
+      // ---------- enganchar el botón de editar + reaplicar imágenes guardadas ----------
+
+      function ensureEditButton(card, courseKey, img) {
+        if (card.dataset.eafitImgWired) return;
+        card.dataset.eafitImgWired = '1';
+
+        // guardamos laE url original de D2L la primera vez que vemos esta superficie, ANTES
+        // de que se le aplique una imagen personalizada — así "quitar imagen personalizada"
+        // puede restaurarla directamente en vez de depender de que D2L repinte la tarjeta.
+        if (!('eafitOriginalUrl' in img.dataset)) {
+          img.dataset.eafitOriginalUrl = getSurfaceUrl(img);
+        }
+
+        // si es un <img>, el ancla para el botón es su contenedor (el <img> raramente
+        // acepta position:relative visualmente igual); si es un div con background-image,
+        // el elemento mismo YA es la "tarjeta visual", así que se ancla directo sobre él.
+        const wrapper = isImgTag(img) ? (img.parentElement || card) : img;
+        const computedPos = getComputedStyle(wrapper).position;
+        if (computedPos === 'static') {
+          wrapper.style.setProperty('position', 'relative');
+        }
+
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.textContent = '✏️';
+        btn.title = 'Cambiar imagen del curso';
+        Object.assign(btn.style, {
+          position: 'absolute', top: '6px', left: '6px', zIndex: '5',
+          width: '30px', height: '30px', borderRadius: '50%', border: 'none',
+          background: 'rgba(0,0,0,.6)', color: '#fff', fontSize: '14px', cursor: 'pointer',
+          opacity: '0', transition: 'opacity .15s ease', display: 'flex',
+          alignItems: 'center', justifyContent: 'center', padding: '0',
+        });
+        wrapper.addEventListener('mouseenter', () => btn.style.setProperty('opacity', '1'));
+        wrapper.addEventListener('mouseleave', () => btn.style.setProperty('opacity', '0'));
+        btn.addEventListener('click', (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          openImagePicker(courseKey, courseKey, img);
+        });
+        wrapper.appendChild(btn);
+      }
+
+      // las fotos de las tarjetas de curso en esta instancia de D2L son <img
+      // class="d2l-organization-image-main" loading="lazy"> SIN ancho/alto reservado por
+      // CSS (su contenedor usa "height: var(--course-image-height)", una variable que D2L
+      // calcula recién en tiempo de ejecución). Eso significa que miden 0x0 hasta que el
+      // navegador termina de cargarlas — y como el MutationObserver solo avisa de cambios
+      // de ESTRUCTURA del DOM (no de que una imagen individual haya terminado de cargar),
+      // el primer escaneo las descartaba por chicas y nunca se volvían a mirar. Por eso acá
+      // enganchamos 'load'/'error' directo en cada <img> candidata (una sola vez) para forzar
+      // un re-escaneo apenas termine de cargar, sin depender de una mutación del DOM.
+      const imgsConListenerDeCarga = new WeakSet();
+
+      // recorre todo el árbol UNA sola vez (cruzando shadow DOM) y junta tanto <img> como
+      // elementos con background-image del tamaño de una tarjeta de curso. Ponemos un
+      // límite superior de tamaño para NO agarrar fondos de página completos (ej. el fondo
+      // de pantalla del script de vaporwave, que cubre toda la ventana).
+      function collectCandidateSurfaces() {
+        const imgs = [];
+        const bgEls = [];
+        const stack = [document];
+        while (stack.length) {
+          const node = stack.pop();
+          if (!node || !node.querySelectorAll) continue;
+          node.querySelectorAll('*').forEach((el) => {
+            if (el.shadowRoot) {
+              stack.push(el.shadowRoot);
+              // CLAVE: un MutationObserver observando el documento principal con subtree:true
+              // NO ve mutaciones que ocurren adentro de un shadow root — cada shadow root
+              // necesita su propio .observe() explícito, igual que querySelectorAll necesita
+              // cruzarlo a mano. La grilla de "Mis cursos" vive 2-3 niveles adentro de shadow
+              // DOM (d2l-my-courses-card-grid-v2 > shadow-root > course-card-grid), así que sin
+              // esto, cuando las tarjetas se insertan ahí adentro, el observer nunca se entera.
+              // .observe() en el mismo target de nuevo es inofensivo (no duplica notificaciones).
+              observer.observe(el.shadowRoot, { childList: true, subtree: true });
+            }
+            if (el.tagName === 'IMG') {
+              if (!imgsConListenerDeCarga.has(el)) {
+                imgsConListenerDeCarga.add(el);
+                el.addEventListener('load', () => {
+                  console.log('[EAFIT imágenes] una <img> candidata terminó de cargar, re-escaneando:', (el.src || '').slice(0, 90));
+                  safeApplyCustomCourseImages('imagen cargó');
+                }, { once: true });
+                el.addEventListener('error', () => {
+                  console.warn('[EAFIT imágenes] una <img> candidata falló al cargar (nunca va a medir tamaño):', el.src);
+                }, { once: true });
+              }
+              const rect = el.getBoundingClientRect();
+              if (rect.width > 60 && rect.height > 40) imgs.push(el);
+            } else {
+              const rect = el.getBoundingClientRect();
+              if (rect.width > 60 && rect.width < 700 && rect.height > 40 && rect.height < 400) {
+                if (getElementBackgroundImageUrl(el)) bgEls.push(el);
+              }
+            }
+          });
+        }
+        return [...imgs, ...bgEls];
+      }
+
+      let lastLoggedCount = -1;
+      let diagnosticLogsLeft = 12;
+      function applyCustomCourseImages() {
+        const surfaces = collectCandidateSurfaces();
+
+        // el home de D2L es un SPA: las tarjetas de "Mis cursos" cargan asíncrono
+        // después del primer render, así que un solo log al ppio no las agarra.
+        // Repetimos el log cada vez que cambia la cantidad de superficies encontradas
+        // (hasta un tope), para capturar el momento en que ya cargaron.
+        if (surfaces.length !== lastLoggedCount && diagnosticLogsLeft > 0) {
+          lastLoggedCount = surfaces.length;
+          diagnosticLogsLeft--;
+          console.log('[EAFIT imágenes] superficies de imagen encontradas en la página (<img> + fondos CSS):', surfaces.length);
+          surfaces.slice(0, 8).forEach((el, i) => {
+            const card = findCardContainer(el);
+            const key = card ? extractCourseKey(card) : null;
+            const rect = el.getBoundingClientRect();
+            const cardRect = card ? card.getBoundingClientRect() : null;
+            const kind = isImgTag(el) ? 'img' : 'bg-css';
+            console.log(
+              `[EAFIT imágenes] surface #${i} (${kind}, <${el.tagName.toLowerCase()}>): url=${getSurfaceUrl(el).slice(0, 90)} | tamaño=${Math.round(rect.width)}x${Math.round(rect.height)} | ` +
+                `card tamaño=${cardRect ? Math.round(cardRect.width) + 'x' + Math.round(cardRect.height) : '-'} | key detectada="${key}"`
+            );
+          });
+        }
+
+        surfaces.forEach((el) => {
+          const card = findCardContainer(el);
+          if (!card) return;
+          const courseKey = extractCourseKey(card);
+          if (!courseKey) return;
+
+          ensureEditButton(card, courseKey, el);
+
+          const custom = getCustomImage(courseKey);
+          if (custom && getSurfaceUrl(el) !== custom) {
+            console.log('[EAFIT imágenes] aplicando imagen personalizada guardada a curso:', courseKey);
+            setSurfaceUrl(el, custom);
+          }
+        });
+      }
+
+      // el observer corre en cada mutación del DOM (D2L es un SPA que re-renderiza seguido);
+      // si applyCustomCourseImages tira una excepción sin capturar, el callback del observer
+      // no rompe, pero sí queremos verlo en consola en vez de quedarnos con imágenes desactualizadas
+      // en silencio sin saber por qué.
+      function safeApplyCustomCourseImages(context) {
+        try {
+          applyCustomCourseImages();
+        } catch (e) {
+          console.error(`[EAFIT imágenes] ERROR en applyCustomCourseImages (${context}):`, e);
+        }
+      }
+
+      let rafScheduled = false;
+      const observer = new MutationObserver(() => {
+        if (rafScheduled) return;
+        rafScheduled = true;
+        requestAnimationFrame(() => {
+          rafScheduled = false;
+          safeApplyCustomCourseImages('mutation observer');
+        });
+      });
+      observer.observe(document.documentElement, { childList: true, subtree: true });
+      console.log('[EAFIT imágenes] MutationObserver activo, esperando cambios en el DOM');
+
+      if (document.body) {
+        safeApplyCustomCourseImages('carga inicial');
+      } else {
+        document.addEventListener('DOMContentLoaded', () => safeApplyCustomCourseImages('DOMContentLoaded'));
+      }
+    })();

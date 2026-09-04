@@ -1,0 +1,7 @@
+# Volcados de páginas de D2L guardadas con "Guardar como" para debuggear.
+# NO subir: contienen datos de sesión reales (XSRF token, sessionToken,
+# Session.UserId), el correo institucional y el documento de identidad del
+# usuario. Se usan solo localmente para inspeccionar el DOM.
+*.html
+interactiva_files/
+pagina_files/

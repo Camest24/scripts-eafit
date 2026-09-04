@@ -1,0 +1,517 @@
+// ==UserScript==
+// @name         EAFIT D2L - Asistente IA (resumen con Gemini)
+// @namespace    http://tampermonkey.net/
+// @version      1.1.0
+// @description  Botón de chat que te deja elegir un módulo y un archivo de la materia, y te lo resume con IA vía OpenRouter. Guarda tu API key localmente en tu navegador.
+// @author       You
+// @match        https://interactivavirtual.eafit.edu.co/*
+// @grant        none
+// @require      https://cdn.jsdelivr.net/npm/pdfjs-dist@2.13.216/legacy/build/pdf.min.js
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  // ==================================================================
+  // Todo pasa por OpenRouter (openrouter.ai): una sola API key te da acceso a
+  // un montón de modelos de distintas empresas con el MISMO formato de llamada.
+  // Si un modelo falla o está saturado, probamos el siguiente de la lista, sin
+  // pedir otra key. Sacá la tuya en https://openrouter.ai/settings/keys (tiene
+  // créditos gratis para arrancar). Lista completa de modelos y sus IDs exactos:
+  // https://openrouter.ai/models — si alguno de estos ya no existe, revisá ahí
+  // el nombre actual y reemplazalo.
+  const OPENROUTER_KEY_STORAGE = 'eafit-ai-openrouter-key';
+  const OPENROUTER_MODELS = [
+    'google/gemini-2.5-flash',
+    'anthropic/claude-haiku-4.5',
+    'openai/gpt-4o-mini',
+  ];
+  // ==================================================================
+
+  const ORIGIN = location.origin;
+
+  // pdf.js necesita su "worker" (un script aparte que hace el trabajo pesado);
+  // le apuntamos a la misma versión que pedimos con @require arriba. Esta build
+  // "legacy" expone la librería bajo este nombre global raro (no window.pdfjsLib)
+  // — es el que usa el propio ejemplo oficial de Mozilla para este tipo de carga.
+  const pdfjsLib = window['pdfjs-dist/build/pdf'];
+
+  if (pdfjsLib) {
+    pdfjsLib.GlobalWorkerOptions.workerSrc =
+      'https://cdn.jsdelivr.net/npm/pdfjs-dist@2.13.216/legacy/build/pdf.worker.min.js';
+    console.log('[EAFIT IA] pdf.js cargó correctamente');
+  } else {
+    console.warn('[EAFIT IA] pdf.js NO cargó — revisar el @require del script');
+  }
+
+  // extrae el texto real de un PDF en el navegador — evita tener que subirlo
+  // como "archivo" a OpenRouter (que exige USD 0.50 de saldo cargado). Si el PDF
+  // es una imagen escaneada sin texto seleccionable, esto devuelve muy poco o
+  // nada, y ahí sí no hay forma de esquivar la restricción de saldo.
+  async function extractPdfText(blob) {
+    if (!pdfjsLib) throw new Error('pdf.js no cargó (revisá que el @require del script esté bien)');
+    const arrayBuffer = await blob.arrayBuffer();
+    const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+    let fullText = '';
+    for (let i = 1; i <= pdf.numPages; i++) {
+      const page = await pdf.getPage(i);
+      const content = await page.getTextContent();
+      const pageText = content.items.map((it) => it.str).join(' ');
+      fullText += `\n\n--- Página ${i} ---\n${pageText}`;
+    }
+    return fullText.trim();
+  }
+
+  // ---------- 1. Lo mismo que el script de descarga: hablar con la API de D2L ----------
+
+  function getOrgUnitId() {
+    const m1 = location.pathname.match(/\/d2l\/(?:home|le\/content)\/(\d+)/);
+    if (m1) return m1[1];
+    const params = new URLSearchParams(location.search);
+    if (params.get('ou')) return params.get('ou');
+    return null;
+  }
+
+  let cachedLeVersion = null;
+  async function getLeVersion() {
+    if (cachedLeVersion) return cachedLeVersion;
+    const res = await fetch(`${ORIGIN}/d2l/api/versions/`, { credentials: 'include' });
+    const versions = await res.json();
+    const le = versions.find((v) => (v.ProductCode || v.productCode) === 'le');
+    const version = le ? (le.LatestVersion || le.latestVersion) : null;
+    cachedLeVersion = version || '1.43';
+    return cachedLeVersion;
+  }
+
+  async function apiGet(path) {
+    const v = await getLeVersion();
+    const url = `${ORIGIN}/d2l/api/le/${v}/${path}`;
+    const res = await fetch(url, { credentials: 'include' });
+    if (!res.ok) throw new Error(`API ${res.status} en ${url}`);
+    return res.json();
+  }
+
+  function sanitize(name) {
+    return String(name || 'sin-titulo').replace(/[\\/:*?"<>|]/g, '-').trim().slice(0, 120);
+  }
+
+  // recorre un módulo (y sus submódulos) juntando los topics tipo archivo, con
+  // su Url real — igual que en el script de descarga
+  async function collectFilesInModule(orgUnitId, moduleId, pathSoFar, out) {
+    const structure = await apiGet(`${orgUnitId}/content/modules/${moduleId}/structure/`);
+    for (const item of structure) {
+      if (item.Type === 0) {
+        await collectFilesInModule(orgUnitId, item.Id, [...pathSoFar, sanitize(item.Title)], out);
+      } else {
+        let topic = item;
+        if (topic.Url === undefined) {
+          try {
+            topic = await apiGet(`${orgUnitId}/content/topics/${item.Id}`);
+          } catch (e) {
+            continue;
+          }
+        }
+        if (topic.TopicType === 1 && topic.Url) {
+          out.push({
+            title: topic.Title || 'sin título',
+            url: topic.Url.startsWith('http') ? topic.Url : ORIGIN + topic.Url,
+          });
+        }
+      }
+    }
+  }
+
+  // ---------- 2. API key de OpenRouter ----------
+
+  function getApiKey() {
+    return localStorage.getItem(OPENROUTER_KEY_STORAGE) || '';
+  }
+  function setApiKey(key) {
+    localStorage.setItem(OPENROUTER_KEY_STORAGE, key);
+  }
+
+  // ---------- 3. Descargar el archivo y mandárselo a Gemini ----------
+
+  function guessMimeType(url, title) {
+    const name = (url.split('?')[0] + ' ' + title).toLowerCase();
+    if (name.endsWith('.pdf')) return 'application/pdf';
+    if (name.endsWith('.txt')) return 'text/plain';
+    if (name.endsWith('.md')) return 'text/plain';
+    if (name.endsWith('.csv')) return 'text/csv';
+    if (name.endsWith('.png')) return 'image/png';
+    if (name.endsWith('.jpg') || name.endsWith('.jpeg')) return 'image/jpeg';
+    return 'application/octet-stream'; // pptx/docx/etc — Gemini puede no entenderlo bien
+  }
+
+  async function blobToBase64(blob) {
+    const buffer = await blob.arrayBuffer();
+    const bytes = new Uint8Array(buffer);
+    let binary = '';
+    const chunkSize = 0x8000;
+    for (let i = 0; i < bytes.length; i += chunkSize) {
+      binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
+    }
+    return btoa(binary);
+  }
+
+  // arma el "content" del mensaje según el tipo de archivo: los PDF van como
+  // type:"file" (OpenRouter los sabe leer, con o sin soporte nativo del modelo),
+  // las imágenes como type:"image_url" — el resto lo mandamos como PDF también
+  // (OpenRouter suele poder parsearlo igual) y si falla, al menos el error es claro
+  function buildFileContentPart(base64, mimeType, fileName) {
+    if (mimeType.startsWith('image/')) {
+      return { type: 'image_url', image_url: { url: `data:${mimeType};base64,${base64}` } };
+    }
+    return {
+      type: 'file',
+      file: { filename: fileName || 'documento', file_data: `data:${mimeType};base64,${base64}` },
+    };
+  }
+
+  async function askOpenRouterWithText(extractedText, promptText, onStatus) {
+    const apiKey = getApiKey();
+    if (!apiKey) throw new Error('No configuraste tu API key de OpenRouter todavía.');
+
+    let lastError;
+    const fullPrompt = `${promptText}\n\n--- CONTENIDO DEL DOCUMENTO ---\n${extractedText}`;
+
+    for (const model of OPENROUTER_MODELS) {
+      if (onStatus) onStatus(`Probando con ${model}...`);
+      try {
+        const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+          body: JSON.stringify({
+            model,
+            messages: [{ role: 'user', content: fullPrompt }],
+          }),
+        });
+        if (res.ok) {
+          const data = await res.json();
+          const text = data && data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
+          return text || '(respuesta vacía)';
+        }
+        const errText = await res.text().catch(() => '');
+        lastError = new Error(`${model}: HTTP ${res.status} — ${errText.slice(0, 250)}`);
+      } catch (e) {
+        lastError = e;
+      }
+    }
+    throw lastError;
+  }
+
+  async function askOpenRouter(base64, mimeType, fileName, promptText, onStatus) {
+    const apiKey = getApiKey();
+    if (!apiKey) throw new Error('No configuraste tu API key de OpenRouter todavía.');
+
+    const filePart = buildFileContentPart(base64, mimeType, fileName);
+    let lastError;
+
+    for (const model of OPENROUTER_MODELS) {
+      if (onStatus) onStatus(`Probando con ${model}...`);
+      try {
+        const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${apiKey}`,
+          },
+          body: JSON.stringify({
+            model,
+            messages: [{ role: 'user', content: [{ type: 'text', text: promptText }, filePart] }],
+            // motor gratis de lectura de PDF (bueno para texto bien estructurado,
+            // como diapositivas/lecturas); si el documento es una imagen escaneada
+            // de mala calidad, puede rendir peor que el motor OCR pago
+            plugins: [{ id: 'file-parser', pdf: { engine: 'pdf-text' } }],
+          }),
+        });
+
+        if (res.ok) {
+          const data = await res.json();
+          const text = data && data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
+          return text || '(respuesta vacía)';
+        }
+
+        const errText = await res.text().catch(() => '');
+        lastError = new Error(`${model}: HTTP ${res.status} — ${errText.slice(0, 250)}`);
+        // 429 (rate limit) y 503 (saturado) son razones válidas para probar el
+        // siguiente modelo; otros errores (401 key inválida, etc.) también
+        // probamos el siguiente por las dudas, pero seguramente van a fallar igual
+      } catch (e) {
+        lastError = e; // error de red, probamos el siguiente modelo igual
+      }
+    }
+    throw lastError;
+  }
+
+  // ---------- 4. UI: botón junto al nombre de la materia + panel de chat ----------
+
+  function injectChatButton() {
+    const orgUnitId = getOrgUnitId();
+    if (!orgUnitId) return;
+    if (document.getElementById('eafit-ai-btn')) return;
+
+    const h1 = document.querySelector('h1');
+    if (!h1 || !h1.textContent.trim()) return;
+
+    const btn = document.createElement('button');
+    btn.id = 'eafit-ai-btn';
+    btn.textContent = '💬 Resumir con IA';
+    Object.assign(btn.style, {
+      display: 'inline-flex', alignItems: 'center', gap: '6px',
+      marginTop: '8px', marginLeft: '8px', padding: '6px 14px',
+      border: '1px solid rgba(0,0,0,.15)', borderRadius: '999px',
+      background: 'rgba(255,255,255,.7)', fontSize: '13px', cursor: 'pointer',
+    });
+    btn.addEventListener('mouseenter', () => (btn.style.background = 'rgba(0,0,0,.06)'));
+    btn.addEventListener('mouseleave', () => (btn.style.background = 'rgba(255,255,255,.7)'));
+    btn.addEventListener('click', () => openChatPanel(orgUnitId));
+
+    // si ya existe el botón de "Descargar todo el curso" del otro script, lo
+    // ponemos justo al lado; si no, al lado del h1 directamente
+    const downloadBtn = document.getElementById('eafit-dl-course-btn');
+    (downloadBtn || h1).insertAdjacentElement('afterend', btn);
+  }
+
+  function openChatPanel(orgUnitId) {
+    let panel = document.getElementById('eafit-ai-panel');
+    if (panel) {
+      panel.style.display = panel.style.display === 'none' ? 'flex' : 'none';
+      return;
+    }
+
+    panel = document.createElement('div');
+    panel.id = 'eafit-ai-panel';
+    Object.assign(panel.style, {
+      position: 'fixed', bottom: '20px', right: '20px', zIndex: 999999,
+      width: '340px', maxHeight: '70vh', background: '#fff', borderRadius: '14px',
+      boxShadow: '0 10px 40px rgba(0,0,0,.3)', display: 'flex', flexDirection: 'column',
+      fontFamily: 'Arial, sans-serif', overflow: 'hidden',
+    });
+
+    const header = document.createElement('div');
+    Object.assign(header.style, {
+      display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+      padding: '10px 14px', background: '#0a84ff', color: '#fff', fontWeight: '700', fontSize: '13px',
+    });
+    header.innerHTML = `<span>💬 Asistente IA — Resúmenes</span>`;
+    const closeBtn = document.createElement('button');
+    closeBtn.textContent = '✕';
+    Object.assign(closeBtn.style, {
+      border: 'none', background: 'transparent', color: '#fff', cursor: 'pointer', fontSize: '14px',
+    });
+    closeBtn.addEventListener('click', () => (panel.style.display = 'none'));
+    header.appendChild(closeBtn);
+    panel.appendChild(header);
+
+    const body = document.createElement('div');
+    Object.assign(body.style, { padding: '14px', overflowY: 'auto', flex: '1', fontSize: '13px', color: '#111' });
+    panel.appendChild(body);
+
+    document.body.appendChild(panel);
+
+    if (!getApiKey()) {
+      renderApiKeyForm(body, () => renderSelectorForm(body, orgUnitId));
+    } else {
+      renderSelectorForm(body, orgUnitId);
+    }
+  }
+
+  function renderApiKeyForm(body, onDone) {
+    body.innerHTML = '';
+    const info = document.createElement('div');
+    info.innerHTML = `Para resumir necesito tu API key de OpenRouter (gratis, con créditos para arrancar). Sacala en
+      <a href="https://openrouter.ai/settings/keys" target="_blank" rel="noopener">openrouter.ai/settings/keys</a>
+      — se guarda solo en tu navegador. Con una sola key probamos varios modelos distintos si alguno falla o está saturado.`;
+    Object.assign(info.style, { marginBottom: '10px', lineHeight: '1.4' });
+    body.appendChild(info);
+
+    const input = document.createElement('input');
+    input.type = 'password';
+    input.placeholder = 'Pegá tu API key de OpenRouter acá';
+    input.value = getApiKey();
+    Object.assign(input.style, {
+      width: '100%', padding: '8px', border: '1px solid #ccc', borderRadius: '6px',
+      boxSizing: 'border-box', marginBottom: '10px', fontSize: '13px', color: '#111',
+    });
+    body.appendChild(input);
+
+    const saveBtn = document.createElement('button');
+    saveBtn.textContent = 'Guardar y continuar';
+    Object.assign(saveBtn.style, {
+      display: 'block', width: '100%', padding: '10px', border: 'none', borderRadius: '6px',
+      background: '#0a84ff', color: '#fff', fontWeight: '700', cursor: 'pointer', fontSize: '13px',
+    });
+    saveBtn.addEventListener('click', () => {
+      const key = input.value.trim();
+      if (!key) return;
+      setApiKey(key);
+      onDone();
+    });
+    body.appendChild(saveBtn);
+  }
+
+  async function renderSelectorForm(body, orgUnitId) {
+    body.innerHTML = 'Cargando módulos...';
+    let modules;
+    try {
+      modules = await apiGet(`${orgUnitId}/content/root/`);
+    } catch (e) {
+      body.innerHTML = `Error leyendo los módulos: ${e.message}`;
+      return;
+    }
+
+    body.innerHTML = '';
+
+    const moduleLabel = document.createElement('div');
+    moduleLabel.textContent = 'Módulo';
+    Object.assign(moduleLabel.style, { fontSize: '12px', color: '#666', marginBottom: '4px' });
+    body.appendChild(moduleLabel);
+
+    const moduleSelect = document.createElement('select');
+    Object.assign(moduleSelect.style, {
+      width: '100%', padding: '8px', marginBottom: '10px', border: '1px solid #ccc',
+      borderRadius: '6px', boxSizing: 'border-box', fontSize: '13px', color: '#111',
+    });
+    modules.forEach((m) => {
+      const opt = document.createElement('option');
+      opt.value = m.Id;
+      opt.textContent = m.Title;
+      moduleSelect.appendChild(opt);
+    });
+    body.appendChild(moduleSelect);
+
+    const fileLabel = document.createElement('div');
+    fileLabel.textContent = 'Archivo';
+    Object.assign(fileLabel.style, { fontSize: '12px', color: '#666', marginBottom: '4px' });
+    body.appendChild(fileLabel);
+
+    const fileSelect = document.createElement('select');
+    Object.assign(fileSelect.style, {
+      width: '100%', padding: '8px', marginBottom: '10px', border: '1px solid #ccc',
+      borderRadius: '6px', boxSizing: 'border-box', fontSize: '13px', color: '#111',
+    });
+    body.appendChild(fileSelect);
+
+    async function loadFilesForModule(moduleId) {
+      fileSelect.innerHTML = '<option>Buscando archivos...</option>';
+      const files = [];
+      try {
+        await collectFilesInModule(orgUnitId, moduleId, [], files);
+      } catch (e) {
+        fileSelect.innerHTML = '';
+        const opt = document.createElement('option');
+        opt.textContent = 'Error buscando archivos';
+        fileSelect.appendChild(opt);
+        return;
+      }
+      fileSelect.innerHTML = '';
+      if (files.length === 0) {
+        const opt = document.createElement('option');
+        opt.textContent = '(este módulo no tiene archivos)';
+        fileSelect.appendChild(opt);
+        return;
+      }
+      files.forEach((f, i) => {
+        const opt = document.createElement('option');
+        opt.value = String(i);
+        opt.textContent = f.title;
+        opt.dataset.url = f.url;
+        fileSelect.appendChild(opt);
+      });
+      fileSelect.__files = files;
+    }
+    moduleSelect.addEventListener('change', () => loadFilesForModule(moduleSelect.value));
+    await loadFilesForModule(moduleSelect.value);
+
+    const summarizeBtn = document.createElement('button');
+    summarizeBtn.textContent = '✨ Resumir';
+    Object.assign(summarizeBtn.style, {
+      display: 'block', width: '100%', padding: '10px', border: 'none', borderRadius: '6px',
+      background: '#0a84ff', color: '#fff', fontWeight: '700', cursor: 'pointer', fontSize: '13px', marginBottom: '10px',
+    });
+    body.appendChild(summarizeBtn);
+
+    const resultBox = document.createElement('div');
+    Object.assign(resultBox.style, {
+      whiteSpace: 'pre-wrap', lineHeight: '1.4', fontSize: '13px', color: '#111',
+      borderTop: '1px solid #eee', paddingTop: '10px', display: 'none',
+    });
+    body.appendChild(resultBox);
+
+    const changeKeyLink = document.createElement('div');
+    changeKeyLink.textContent = 'Cambiar API key';
+    Object.assign(changeKeyLink.style, { fontSize: '11px', color: '#999', cursor: 'pointer', marginTop: '8px', textDecoration: 'underline' });
+    changeKeyLink.addEventListener('click', () => {
+      renderApiKeyForm(body, () => renderSelectorForm(body, orgUnitId));
+    });
+    body.appendChild(changeKeyLink);
+
+    summarizeBtn.addEventListener('click', async () => {
+      const files = fileSelect.__files;
+      const idx = parseInt(fileSelect.value, 10);
+      if (!files || isNaN(idx) || !files[idx]) return;
+      const file = files[idx];
+
+      resultBox.style.display = 'block';
+      resultBox.textContent = 'Descargando el archivo...';
+      summarizeBtn.disabled = true;
+
+      try {
+        const res = await fetch(file.url, { credentials: 'include' });
+        if (!res.ok) throw new Error(`No pude descargar el archivo (HTTP ${res.status})`);
+        const blob = await res.blob();
+
+        if (blob.size > 15 * 1024 * 1024) {
+          resultBox.textContent = 'Este archivo pesa más de 15MB — por ahora el asistente solo soporta archivos livianos (PDFs de apuntes/diapositivas, normalmente).';
+          summarizeBtn.disabled = false;
+          return;
+        }
+
+        resultBox.textContent = 'Leyendo el contenido...';
+        const mimeType = guessMimeType(file.url, file.title);
+        const prompt = `Resumí el contenido de este documento en español, de forma clara y organizada en puntos clave, pensado para que un estudiante repase antes de un examen. Si el documento no es texto legible (ej. es una imagen escaneada de mala calidad o un formato que no podés leer bien), decímelo directamente en vez de inventar contenido.`;
+
+        let summary;
+        if (mimeType === 'application/pdf') {
+          // primero intentamos extraer el texto nosotros mismos (gratis, sin
+          // pasar por la restricción de saldo de OpenRouter para archivos)
+          let extractedText = '';
+          try {
+            extractedText = await extractPdfText(blob);
+            console.log('[EAFIT IA] texto extraído del PDF:', extractedText.length, 'caracteres');
+          } catch (e) {
+            console.warn('[EAFIT IA] falló la extracción de texto del PDF:', e);
+            extractedText = '';
+          }
+
+          if (extractedText.length > 200) {
+            summary = await askOpenRouterWithText(extractedText, prompt, (statusMsg) => {
+              resultBox.textContent = statusMsg;
+            });
+          } else {
+            resultBox.textContent = 'Este PDF no tiene texto seleccionable (parece una imagen escaneada) — para leerlo hace falta subirlo como archivo, y eso requiere que tu cuenta de OpenRouter tenga al menos USD 0.50 de saldo cargado (openrouter.ai/settings/credits). Probando igual por si tu cuenta ya lo tiene...';
+            const base64 = await blobToBase64(blob);
+            summary = await askOpenRouter(base64, mimeType, file.title, prompt, (statusMsg) => {
+              resultBox.textContent = statusMsg;
+            });
+          }
+        } else {
+          const base64 = await blobToBase64(blob);
+          summary = await askOpenRouter(base64, mimeType, file.title, prompt, (statusMsg) => {
+            resultBox.textContent = statusMsg;
+          });
+        }
+        resultBox.textContent = summary;
+      } catch (e) {
+        resultBox.textContent = 'Error: ' + e.message;
+      } finally {
+        summarizeBtn.disabled = false;
+      }
+    });
+  }
+
+  injectChatButton();
+  setInterval(injectChatButton, 1200); // D2L es un SPA, reinyectamos si hace falta
+})();

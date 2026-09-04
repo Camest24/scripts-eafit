@@ -1,0 +1,496 @@
+// ==UserScript==
+// @name         EAFIT D2L - Descargar todo el curso
+// @namespace    http://tampermonkey.net/
+// @version      1.0.0
+// @description  Agrega un botón flotante que recorre el árbol de contenido de la materia (vía la API de D2L) y descarga todos los archivos en un .zip con la estructura de carpetas del curso.
+// @author       You
+// @match        https://interactivavirtual.eafit.edu.co/*
+// @icon         https://interactivavirtual.eafit.edu.co/favicon.ico
+// @grant        none
+// @require      https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  const ORIGIN = location.origin;
+
+  // ---------- 1. Detectar el orgUnitId (id de la materia) desde la URL ----------
+
+  function getOrgUnitId() {
+    const m1 = location.pathname.match(/\/d2l\/(?:home|le\/content)\/(\d+)/);
+    if (m1) return m1[1];
+    const params = new URLSearchParams(location.search);
+    if (params.get('ou')) return params.get('ou');
+    return null;
+  }
+
+  // ---------- 2. Resolver la versión de la API LE disponible en este D2L ----------
+
+  let cachedLeVersion = null;
+  async function getLeVersion() {
+    if (cachedLeVersion) return cachedLeVersion;
+    const res = await fetch(`${ORIGIN}/d2l/api/versions/`, { credentials: 'include' });
+    const versions = await res.json();
+    // distintas instancias de D2L devuelven las claves con mayúscula/minúscula distinta
+    const le = versions.find((v) => (v.ProductCode || v.productCode) === 'le');
+    const version = le ? (le.LatestVersion || le.latestVersion) : null;
+    cachedLeVersion = version || '1.43'; // fallback conservador si no pudimos leer la lista
+    console.log('[EAFIT downloader] versión de API LE detectada:', cachedLeVersion);
+    return cachedLeVersion;
+  }
+
+  async function apiGet(path) {
+    const v = await getLeVersion();
+    const url = `${ORIGIN}/d2l/api/le/${v}/${path}`;
+    const res = await fetch(url, { credentials: 'include' });
+    if (!res.ok) throw new Error(`API ${res.status} en ${url}`);
+    return res.json();
+  }
+
+  // ---------- 3. Recorrer el árbol de contenido y juntar todos los topics tipo archivo ----------
+
+  function sanitize(name) {
+    return String(name || 'sin-titulo').replace(/[\\/:*?"<>|]/g, '-').trim().slice(0, 120);
+  }
+
+  // dado un topic (objeto crudo de la API), decide si es un archivo descargable y devuelve su Url
+  function fileUrlFromTopic(topic) {
+    // TopicType 1 = archivo. También cubrimos el caso de que ya venga la Url embebida en la estructura.
+    if (topic.TopicType === 1 && topic.Url) return topic.Url;
+    return null;
+  }
+
+  async function collectFiles(orgUnitId, moduleId, pathSoFar, out, log) {
+    const structure = await apiGet(`${orgUnitId}/content/modules/${moduleId}/structure/`);
+    for (const item of structure) {
+      // Type 0 = submódulo (carpeta), Type 1 = topic (archivo, link, etc.)
+      if (item.Type === 0) {
+        const subPath = [...pathSoFar, sanitize(item.Title)];
+        log(`Explorando: ${subPath.join(' / ')}`);
+        await collectFiles(orgUnitId, item.Id, subPath, out, log);
+      } else {
+        let topic = item;
+        // si la estructura no trae Url directamente, pedimos el detalle del topic
+        if (topic.Url === undefined) {
+          try {
+            topic = await apiGet(`${orgUnitId}/content/topics/${item.Id}`);
+          } catch (e) {
+            continue;
+          }
+        }
+        const fileUrl = fileUrlFromTopic(topic);
+        if (fileUrl) {
+          out.push({
+            title: sanitize(topic.Title),
+            url: fileUrl.startsWith('http') ? fileUrl : ORIGIN + fileUrl,
+            folder: pathSoFar,
+          });
+        }
+      }
+    }
+  }
+
+  async function collectAllFiles(orgUnitId, log) {
+    const rootModules = await apiGet(`${orgUnitId}/content/root/`);
+    const files = [];
+    for (const mod of rootModules) {
+      log(`Explorando: ${sanitize(mod.Title)}`);
+      await collectFiles(orgUnitId, mod.Id, [sanitize(mod.Title)], files, log);
+    }
+    return files;
+  }
+
+  // ---------- 4. Descargar todo y empaquetar en .zip ----------
+
+  function guessExtFromUrl(url) {
+    const m = url.split('?')[0].match(/\.([a-zA-Z0-9]{1,6})$/);
+    return m ? m[1] : '';
+  }
+
+  async function downloadAllAsZip(orgUnitId, courseName, ui) {
+    const zip = new JSZip();
+    ui.setStatus('Buscando archivos en el curso...');
+    const files = await collectAllFiles(orgUnitId, ui.setStatus);
+
+    if (files.length === 0) {
+      ui.setStatus('No se encontraron archivos descargables en esta materia.');
+      return;
+    }
+
+    ui.setStatus(`Encontrados ${files.length} archivos. Descargando...`);
+    let done = 0;
+    const usedNames = new Set();
+
+    for (const f of files) {
+      try {
+        const res = await fetch(f.url, { credentials: 'include' });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const blob = await res.blob();
+
+        let fileName = f.title;
+        const ext = guessExtFromUrl(f.url);
+        if (ext && !fileName.toLowerCase().endsWith('.' + ext.toLowerCase())) {
+          fileName = `${fileName}.${ext}`;
+        }
+
+        const folderPath = f.folder.join('/');
+        let fullPath = folderPath ? `${folderPath}/${fileName}` : fileName;
+        // evitar colisiones de nombre dentro de la misma carpeta
+        let counter = 2;
+        while (usedNames.has(fullPath)) {
+          fullPath = folderPath
+            ? `${folderPath}/${fileName.replace(/(\.[^.]+)?$/, ` (${counter})$1`)}`
+            : fileName.replace(/(\.[^.]+)?$/, ` (${counter})$1`);
+          counter++;
+        }
+        usedNames.add(fullPath);
+
+        zip.file(fullPath, blob);
+      } catch (e) {
+        console.warn('[EAFIT downloader] falló:', f.url, e);
+      }
+      done++;
+      ui.setStatus(`Descargando... ${done}/${files.length}`);
+    }
+
+    ui.setStatus('Comprimiendo en .zip...');
+    const zipBlob = await zip.generateAsync({ type: 'blob' }, (meta) => {
+      ui.setStatus(`Comprimiendo... ${meta.percent.toFixed(0)}%`);
+    });
+
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(zipBlob);
+    a.download = `${sanitize(courseName)}.zip`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+
+    ui.setStatus(`Listo — ${files.length} archivos descargados ✔`);
+  }
+
+  // ---------- 4b. Descargar solo UN módulo (para el ícono por tarjeta de contenido) ----------
+
+  async function downloadModuleAsZip(orgUnitId, moduleId, moduleTitle, ui) {
+    const zip = new JSZip();
+    ui.setStatus(`Buscando archivos en "${moduleTitle}"...`);
+    const files = [];
+    await collectFiles(orgUnitId, moduleId, [sanitize(moduleTitle)], files, ui.setStatus);
+
+    if (files.length === 0) {
+      ui.setStatus(`"${moduleTitle}" no tiene archivos descargables.`);
+      return;
+    }
+
+    ui.setStatus(`Encontrados ${files.length} archivos. Descargando...`);
+    let done = 0;
+    const usedNames = new Set();
+
+    for (const f of files) {
+      try {
+        const res = await fetch(f.url, { credentials: 'include' });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const blob = await res.blob();
+
+        let fileName = f.title;
+        const ext = guessExtFromUrl(f.url);
+        if (ext && !fileName.toLowerCase().endsWith('.' + ext.toLowerCase())) {
+          fileName = `${fileName}.${ext}`;
+        }
+
+        // en la descarga de un solo módulo no repetimos el nombre del módulo como carpeta raíz
+        const folderPath = f.folder.slice(1).join('/');
+        let fullPath = folderPath ? `${folderPath}/${fileName}` : fileName;
+        let counter = 2;
+        while (usedNames.has(fullPath)) {
+          fullPath = folderPath
+            ? `${folderPath}/${fileName.replace(/(\.[^.]+)?$/, ` (${counter})$1`)}`
+            : fileName.replace(/(\.[^.]+)?$/, ` (${counter})$1`);
+          counter++;
+        }
+        usedNames.add(fullPath);
+
+        zip.file(fullPath, blob);
+      } catch (e) {
+        console.warn('[EAFIT downloader] falló:', f.url, e);
+      }
+      done++;
+      ui.setStatus(`Descargando... ${done}/${files.length}`);
+    }
+
+    ui.setStatus('Comprimiendo en .zip...');
+    const zipBlob = await zip.generateAsync({ type: 'blob' }, (meta) => {
+      ui.setStatus(`Comprimiendo... ${meta.percent.toFixed(0)}%`);
+    });
+
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(zipBlob);
+    a.download = `${sanitize(moduleTitle)}.zip`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+
+    ui.setStatus(`Listo — ${files.length} archivos descargados ✔`);
+  }
+
+  // ---------- 5. UI: ícono debajo del nombre de la materia + un ícono por cada
+
+  // tarjeta de contenido, matcheando por TÍTULO contra la API (no por href, que es
+  // frágil) ----------
+
+  function ensureToast() {
+    let toast = document.getElementById('eafit-dl-status');
+    if (toast) return toast;
+    toast = document.createElement('div');
+    toast.id = 'eafit-dl-status';
+    Object.assign(toast.style, {
+      position: 'fixed',
+      right: '20px',
+      bottom: '20px',
+      zIndex: 999999,
+      maxWidth: '300px',
+      padding: '10px 14px',
+      background: 'rgba(0,0,0,.85)',
+      color: '#fff',
+      borderRadius: '8px',
+      fontSize: '12px',
+      fontFamily: 'Arial, sans-serif',
+      boxShadow: '0 6px 18px rgba(0,0,0,.3)',
+      display: 'none',
+    });
+    document.body.appendChild(toast);
+    return toast;
+  }
+
+  function makeIcon(title) {
+    const icon = document.createElement('button');
+    icon.className = 'eafit-dl-icon';
+    icon.title = title;
+    icon.textContent = '📥';
+    Object.assign(icon.style, {
+      display: 'inline-flex',
+      alignItems: 'center',
+      justifyContent: 'center',
+      marginLeft: '6px',
+      width: '22px',
+      height: '22px',
+      padding: '0',
+      border: 'none',
+      borderRadius: '5px',
+      background: 'transparent',
+      fontSize: '14px',
+      cursor: 'pointer',
+      verticalAlign: 'middle',
+      lineHeight: '1',
+    });
+    icon.addEventListener('mouseenter', () => (icon.style.background = 'rgba(0,0,0,.08)'));
+    icon.addEventListener('mouseleave', () => (icon.style.background = 'transparent'));
+    return icon;
+  }
+
+  async function runDownload(icon, fn, ui) {
+    icon.disabled = true;
+    const original = icon.textContent;
+    icon.textContent = '⏳';
+    try {
+      await fn();
+    } catch (err) {
+      ui.setStatus('Error: ' + err.message);
+      console.error('[EAFIT downloader]', err);
+    } finally {
+      icon.disabled = false;
+      icon.textContent = original;
+    }
+  }
+
+  // ---- 5a. botón "descargar todo el curso" debajo del nombre de la materia ----
+
+  function injectCourseHomeButton(ui) {
+    const orgUnitId = getOrgUnitId();
+    if (!orgUnitId) return;
+    if (document.getElementById('eafit-dl-course-btn')) return;
+
+    const h1 = document.querySelector('h1');
+    if (!h1 || !h1.textContent.trim()) return;
+
+    const btn = document.createElement('button');
+    btn.id = 'eafit-dl-course-btn';
+    btn.textContent = '📥 Descargar todo el curso';
+    Object.assign(btn.style, {
+      display: 'inline-flex',
+      alignItems: 'center',
+      gap: '6px',
+      marginTop: '8px',
+      marginBottom: '4px',
+      padding: '6px 14px',
+      border: '1px solid rgba(0,0,0,.15)',
+      borderRadius: '999px',
+      background: 'rgba(255,255,255,.7)',
+      fontSize: '13px',
+      cursor: 'pointer',
+    });
+    btn.addEventListener('mouseenter', () => (btn.style.background = 'rgba(0,0,0,.06)'));
+    btn.addEventListener('mouseleave', () => (btn.style.background = 'rgba(255,255,255,.7)'));
+
+    btn.addEventListener('click', () => {
+      const courseName = document.title.split('|')[0].trim() || `curso-${orgUnitId}`;
+      runDownload(btn, () => downloadAllAsZip(orgUnitId, courseName, ui), ui).then(() => {
+        btn.textContent = '📥 Descargar todo el curso';
+      });
+    });
+
+    h1.insertAdjacentElement('afterend', btn);
+  }
+
+  // ---- 5b. un ícono por cada tarjeta de "Contenidos del curso" ----
+  // en vez de leer el href (frágil, cambia con la versión de D2L), matcheamos por
+  // TÍTULO EXACTO contra los módulos raíz que devuelve la API, y le insertamos el
+  // ícono al nodo de texto que dice ese título en la tarjeta.
+
+  let moduleTitlesCache = { orgUnitId: null, modules: [] };
+
+  async function getRootModules(orgUnitId) {
+    if (moduleTitlesCache.orgUnitId === orgUnitId) return moduleTitlesCache.modules;
+    const rootModules = await apiGet(`${orgUnitId}/content/root/`);
+    moduleTitlesCache = { orgUnitId, modules: rootModules };
+    return rootModules;
+  }
+
+  // ---- buscador que atraviesa Shadow DOM e iframes del mismo dominio ----
+  // Los componentes de D2L (Lit/@brightspace-ui) renderizan su contenido adentro de un
+  // shadowRoot, que document.querySelectorAll() NO puede ver. Y algunas secciones de
+  // EAFIT (los widgets "legacy", como vimos en la consola con LegacyWidgetViewer.d2l)
+  // cargan directamente adentro de un <iframe>, que es OTRO documento aparte — ahí ni
+  // el shadow-DOM-walker entra. Esta función baja recursivamente por ambos: cualquier
+  // shadowRoot abierto Y cualquier iframe del mismo dominio (uno de otro dominio
+  // tiraría error de seguridad al intentar leerlo, por eso el try/catch).
+  function deepQueryAll(root, selector) {
+    const results = [];
+    const stack = [root];
+    while (stack.length) {
+      const node = stack.pop();
+      if (!node || !node.querySelectorAll) continue;
+      results.push(...node.querySelectorAll(selector));
+      const all = node.querySelectorAll('*');
+      for (const el of all) {
+        if (el.shadowRoot) stack.push(el.shadowRoot);
+        if (el.tagName === 'IFRAME') {
+          try {
+            const doc = el.contentDocument;
+            if (doc) stack.push(doc);
+          } catch (e) {
+            // iframe de otro dominio, no podemos leerlo — no hay nada que hacer ahí
+          }
+        }
+      }
+    }
+    return results;
+  }
+
+  // antes exigíamos que el elemento no tuviera hijos (nodo "hoja" puro), pero los
+  // títulos de las tarjetas suelen partirse en 2 líneas con un <br> real (no con
+  // wrap por CSS), lo que rompía ese chequeo. Ahora toleramos <br>/<span>/<b>/etc.
+  // (puro formato de texto) y solo rechazamos si hay algo más (un ícono, un link, etc.)
+  const TEXT_ONLY_TAGS = new Set(['BR', 'B', 'STRONG', 'EM', 'I', 'SPAN', 'SMALL']);
+  function isPureTextContainer(el) {
+    for (const child of el.children) {
+      if (!TEXT_ONLY_TAGS.has(child.tagName)) return false;
+      if (!isPureTextContainer(child)) return false;
+    }
+    return true;
+  }
+
+  // compara el texto de la tarjeta contra el título real de la API, tolerando que
+  // la tarjeta lo muestre truncado con "..." (ej. "Ejercicios sugeridos - Clase Magist...")
+  function titleMatches(domText, apiTitle) {
+    domText = domText.trim();
+    apiTitle = apiTitle.trim();
+    if (domText === apiTitle) return true;
+    const truncated = domText.replace(/(\.{3}|…)$/, '').trim();
+    return truncated.length > 3 && truncated !== domText && apiTitle.startsWith(truncated);
+  }
+
+  let loggedIframeInfo = false;
+  function logIframeInfoOnce() {
+    if (loggedIframeInfo) return;
+    loggedIframeInfo = true;
+    const iframes = document.querySelectorAll('iframe');
+    const info = Array.from(iframes).map((f) => {
+      let accessible = false;
+      try {
+        accessible = !!f.contentDocument;
+      } catch (e) {
+        accessible = false;
+      }
+      return { src: f.src || '(sin src)', accessible };
+    });
+    console.log('[EAFIT downloader] iframes en la página:', info);
+  }
+
+  async function injectModuleIcons(ui) {
+    const orgUnitId = getOrgUnitId();
+    if (!orgUnitId) return;
+    logIframeInfoOnce();
+
+    let modules;
+    try {
+      modules = await getRootModules(orgUnitId);
+      console.log('[EAFIT downloader] módulos encontrados:', modules.map((m) => m.Title));
+    } catch (e) {
+      console.warn('[EAFIT downloader] no se pudo leer content/root/:', e);
+      return; // todavía no hay sesión/curso válido, reintentamos en el próximo ciclo
+    }
+
+    modules.forEach((mod) => {
+      const title = (mod.Title || '').trim();
+      if (!title) return;
+
+      // buscamos el contenedor de puro-texto (título) que diga este título (exacto o
+      // truncado) dentro de la tarjeta, atravesando shadow DOM si hace falta
+      const candidates = deepQueryAll(document, 'a, h1, h2, h3, h4, h5, span, div, p, strong, b, label');
+      let found = false;
+      for (const el of candidates) {
+        if (isPureTextContainer(el) && titleMatches(el.textContent, title)) {
+          found = true;
+          if (el.querySelector('.eafit-dl-icon') || el.closest('#eafit-dl-course-btn')) continue;
+          // ya tiene ícono (por si el título se repite en más de un lugar)
+          if (el.dataset.eafitDlDone) continue;
+          el.dataset.eafitDlDone = '1';
+
+          const icon = makeIcon(`Descargar "${title}"`);
+          icon.addEventListener('click', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            runDownload(icon, () => downloadModuleAsZip(orgUnitId, mod.Id, title, ui), ui);
+          });
+          el.appendChild(icon);
+          break; // un ícono por módulo alcanza, aunque el título aparezca 2 veces
+        }
+      }
+      if (!found) {
+        console.log('[EAFIT downloader] no encontré en el DOM el título:', JSON.stringify(title));
+      }
+    });
+  }
+
+  function buildUI() {
+    const ui = { setStatus(text) {
+      const toast = ensureToast();
+      toast.style.display = 'block';
+      toast.textContent = text;
+      console.log('[EAFIT downloader]', text);
+    } };
+    injectCourseHomeButton(ui);
+    injectModuleIcons(ui);
+    return ui;
+  }
+
+  // D2L es un SPA: el h1 y las tarjetas de contenido se re-renderizan al navegar,
+  // así que revisamos cada 1.2s por si hay que reinyectar.
+  const ui = buildUI();
+  setInterval(() => {
+    injectCourseHomeButton(ui);
+    injectModuleIcons(ui);
+  }, 1200);
+})();

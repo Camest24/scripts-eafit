@@ -1,0 +1,521 @@
+// ==UserScript==
+// @name         EAFIT D2L - Fondo Vaporwave (blur)
+// @namespace    http://tampermonkey.net/
+// @version      1.0.0
+// @description  Pone una imagen de fondo (vaporwave) con blur detrás de todo en el D2L de EAFIT. Solo esto, no toca nada más.
+// @author       You
+// @match        https://interactivavirtual.eafit.edu.co/*
+// @grant        none
+// @run-at       document-start
+// ==/UserScript==
+
+// IMPORTANTE — cómo se comporta este script adentro de un <iframe>:
+// Varios widgets y páginas de D2L ("Contenidos del curso", "Contenido"/Lessons,
+// Actualizaciones) son un <iframe> del MISMO dominio, así que Tampermonkey corre
+// este script ADENTRO de ellos también, como una instancia aparte. Eso trae dos
+// problemas opuestos, y hay que resolver los dos:
+//
+//  1. Si adentro del iframe inyectamos nuestro #eafit-vaporwave-bg, como es
+//     position:fixed se ancla al viewport DEL IFRAME (no al de la página) — o
+//     sea, la misma foto dibujada de nuevo a otra escala: ese era el "fondo
+//     repetido". Y el barrido de "wrappers grandes" mide contra el ancho del
+//     IFRAME, así que adentro agarra tarjetas de contenido normales y las deja
+//     transparentes (los tiles se veían lavados).
+//
+//  2. Pero apagar el script del todo en iframes (@noframes) es peor: el <body>
+//     del iframe se queda con su fondo blanco nativo y TAPA la foto de la página
+//     — por eso al entrar a una clase el fondo se veía blanco.
+//
+// Solución: adentro de un iframe corremos SOLO lo que lo vuelve transparente
+// (html/body) y lo que arregla el contraste del texto. La foto la dibuja
+// únicamente la página principal, y se ve a través de los iframes.
+
+(function () {
+  'use strict';
+
+  const BACKGROUND_IMAGE_URL = 'https://www.pixartprinting.es/blog/wp-content/uploads/2023/08/Vaporwave.jpg';
+  const BLUR_PX = 8; // subí o bajá este número para más o menos blur
+
+  // ¿estamos en la página principal o adentro de un iframe? (ver el comentario
+  // largo arriba: adentro de un iframe hacemos mucho menos)
+  let IS_TOP_FRAME = true;
+  try {
+    IS_TOP_FRAME = window.top === window.self;
+  } catch (e) {
+    IS_TOP_FRAME = false; // si ni siquiera podemos preguntarlo, no somos el top
+  }
+  console.log('[EAFIT vaporwave] script iniciado |', IS_TOP_FRAME ? 'página principal' : 'adentro de un iframe:  ' + location.pathname);
+
+  const style = document.createElement('style');
+  style.textContent = `
+    /* dejamos pasar nuestro fondo — D2L pinta el body de blanco/gris por default */
+    html, body {
+      background: transparent !important;
+    }
+
+    #eafit-vaporwave-bg {
+      position: fixed;
+      /* un poco más grande que la pantalla: el blur "come" los bordes, así no
+         quedan tiras transparentes en las orillas */
+      inset: -20px;
+      z-index: -1;
+      background: url('${BACKGROUND_IMAGE_URL}') center center / cover no-repeat;
+      filter: blur(${BLUR_PX}px);
+      pointer-events: none;
+    }
+  `;
+  document.head.appendChild(style);
+
+  function injectBackground() {
+    // la foto la dibuja SOLO la página principal — adentro de un iframe sería
+    // una segunda copia anclada al viewport del iframe (el "fondo repetido")
+    if (!IS_TOP_FRAME) return;
+    if (document.getElementById('eafit-vaporwave-bg')) return;
+    const bg = document.createElement('div');
+    bg.id = 'eafit-vaporwave-bg';
+    document.body.appendChild(bg);
+  }
+
+  // el tema TemaLiquidGlass.user (si está instalado) agrega su propio
+  // "#glass-blob-layer": 4 manchas de color planas y difuminadas, pensadas para
+  // flotar sobre SU fondo blanco liso. Con nuestra foto de vaporwave de fondo,
+  // esas manchas de color quedan flotando encima/al lado de la foto y se ven
+  // como parches de color sueltos — eso es lo que se reportó como "fondo
+  // repetido". No son parte de nuestra imagen; son un elemento de OTRO script.
+  // Un estilo en línea con !important le gana a cualquier hoja de estilos,
+  // sin importar el orden de carga de los scripts (mismo truco que usamos para
+  // neutralizar los wrappers de D2L).
+  function hideLiquidGlassBlobs() {
+    const blobLayer = document.getElementById('glass-blob-layer');
+    if (blobLayer && !blobLayer.dataset.eafitHidden) {
+      blobLayer.style.setProperty('display', 'none', 'important');
+      blobLayer.dataset.eafitHidden = '1';
+      console.log('[EAFIT vaporwave] se escondieron los "blobs" de color del tema Liquid Glass (competían visualmente con la foto de fondo)');
+    }
+  }
+
+  // D2L parece pintarle un fondo blanco opaco a algún contenedor grande (el
+  // "wrapper" de la página) una vez termina de cargar todo — eso tapaba nuestra
+  // capa de fondo a los pocos segundos. En vez de adivinar el nombre de esa
+  // clase (puede cambiar), buscamos cualquier contenedor GRANDE (que ocupe casi
+  // toda la pantalla) con fondo opaco entre <body> y el contenido, y lo volvemos
+  // transparente. Solo tocamos contenedores grandes para no romper tarjetas chicas.
+  // busca dentro de Shadow DOM también (los íconos de la barra de EAFIT viven
+  // adentro de componentes con shadow root)
+  function deepQuerySelectorAll(root, selector) {
+    const results = [];
+    const stack = [root];
+    while (stack.length) {
+      const node = stack.pop();
+      if (!node || !node.querySelectorAll) continue;
+      results.push(...node.querySelectorAll(selector));
+      node.querySelectorAll('*').forEach((el) => {
+        if (el.shadowRoot) stack.push(el.shadowRoot);
+      });
+    }
+    return results;
+  }
+
+  // sube por los padres buscando el primer fondo opaco real, CRUZANDO shadow
+  // DOM correctamente (parentElement da null en la raíz de un shadow root; ahí
+  // hay que seguir por shadowRoot.host). Sin esto, el texto de adentro de
+  // componentes con shadow root (como las tarjetas de "Mis cursos") se
+  // consideraba "sin fondo" por error, y se pintaba blanco sobre blanco.
+  function getParentAcrossShadow(node) {
+    if (node.parentElement) return node.parentElement;
+    const root = node.getRootNode();
+    if (root && root.host) return root.host;
+    return null;
+  }
+  // saca el alpha de un color computado. Chrome devuelve "rgba(r, g, b, a)" o
+  // "rgb(r g b / a)"; si el formato es otro (raro), asumimos opaco — es la
+  // opción conservadora: dejamos el texto como está en vez de arriesgar blanco
+  // sobre blanco.
+  function parseAlpha(color) {
+    const m = color.match(/rgba?\(([^)]+)\)/);
+    if (!m) return 1;
+    const inner = m[1];
+    const slash = inner.split('/');
+    if (slash.length === 2) {
+      const a = slash[1].trim();
+      return a.endsWith('%') ? parseFloat(a) / 100 : parseFloat(a);
+    }
+    const parts = inner.split(',');
+    return parts.length >= 4 ? parseFloat(parts[3]) : 1;
+  }
+
+  // BUG (texto negro ilegible adentro de una clase): antes esta función tomaba
+  // CUALQUIER color con alpha > 0 como "fondo opaco", incluso un
+  // rgba(255,255,255,0.05). Sobre la foto oscura de vaporwave, un fondo del 5%
+  // no tapa nada — la foto se sigue viendo — pero el texto quedaba sin pintar y
+  // se leía negro sobre oscuro. Ahora exigimos que el fondo tape de verdad.
+  const OPAQUE_ALPHA_MIN = 0.5;
+  function findsOpaqueAncestorBg(el) {
+    let node = el;
+    while (node && node !== document.documentElement) {
+      const bg = getComputedStyle(node).backgroundColor;
+      if (bg && bg !== 'transparent' && parseAlpha(bg) >= OPAQUE_ALPHA_MIN) return bg;
+      node = getParentAcrossShadow(node);
+    }
+    return null;
+  }
+
+  // los menús desplegables (notificaciones, perfil, "seleccionar curso", etc.)
+  // se insertan flotando y animando su entrada — en el instante justo en que el
+  // MutationObserver los detecta, su fondo real todavía puede no "verse" en
+  // getComputedStyle, así que quedaban marcados como "sin fondo opaco" y su
+  // texto se pintaba blanco sobre blanco. Por eso no les tocamos el color.
+  //
+  // BUG (texto negro ilegible adentro de una clase): antes esto se detectaba
+  // como "cualquier ancestro con position fixed/absolute", que es MUCHO más
+  // amplio que los menús — la barra lateral de "Contenido" (la lista de
+  // LECTURA_...) es un panel sticky/fixed de la página, y por eso su texto
+  // quedaba excluido del blanqueo y se leía negro sobre la foto oscura, para
+  // siempre. Ahora identificamos los desplegables REALES por lo que son: en
+  // esta instancia de D2L el panel flotante en sí siempre es
+  // <d2l-dropdown-content popover="manual"> / <d2l-dropdown-menu popover="manual">,
+  // <d2l-menu role="menu"> o .d2l-floating-container.
+  //
+  // BUG (íconos oscuros en la barra de inicio): acá había además un
+  // tag.includes('dropdown') / tag.includes('menu'), y eso era demasiado amplio.
+  // Los botones FIJOS de la barra (correo, chat, campana) son
+  // <d2l-labs-navigation-dropdown-button-icon> — el tag contiene "dropdown", pero
+  // ese elemento NO es el panel flotante, es el botón que lo abre, y vive siempre
+  // visible sobre la foto. Al subir desde el ícono se chocaba con ese tag, se lo
+  // marcaba como "menú" y el ícono quedaba fuera del blanqueo → negro sobre la
+  // foto oscura. El chequeo de popover/role/clase ya identifica bien al panel
+  // flotante de verdad (el botón no tiene popover; su hijo d2l-dropdown-content sí).
+  function hasFloatingMenuAncestor(el) {
+    let node = el;
+    while (node && node !== document.documentElement) {
+      if (node.nodeType === 1) {
+        if (
+          node.hasAttribute('popover') ||
+          node.getAttribute('role') === 'menu' ||
+          (node.classList && node.classList.contains('d2l-floating-container'))
+        ) {
+          return true;
+        }
+      }
+      node = getParentAcrossShadow(node);
+    }
+    return false;
+  }
+
+  // los íconos (mail, chat, campana, engranaje, etc.) que quedan flotando sobre
+  // el fondo vaporwave se pierden porque son oscuros por default — los pintamos
+  // blancos, pero SOLO a los que de verdad están sobre nuestro fondo (no a los
+  // que están sobre una tarjeta blanca en otra parte de la página)
+  function whitenIconsOverBackground() {
+    deepQuerySelectorAll(document, 'svg').forEach((svg) => {
+      if (hasFloatingMenuAncestor(svg)) {
+        if (svg.dataset.eafitWhitened) {
+          svg.style.removeProperty('fill');
+          svg.style.removeProperty('color');
+          svg.querySelectorAll('path, circle, rect, polygon, ellipse').forEach((p) => {
+            p.style.removeProperty('fill');
+          });
+          delete svg.dataset.eafitWhitened;
+        }
+        return;
+      }
+      const bg = findsOpaqueAncestorBg(svg);
+      if (bg === null) {
+        svg.style.setProperty('fill', '#fff', 'important');
+        svg.style.setProperty('color', '#fff', 'important');
+        svg.querySelectorAll('path, circle, rect, polygon, ellipse').forEach((p) => {
+          p.style.setProperty('fill', '#fff', 'important');
+        });
+        svg.dataset.eafitWhitened = '1';
+      } else if (svg.dataset.eafitWhitened) {
+        // resultó que SÍ tiene fondo opaco (ej. un menú desplegable que recién
+        // ahora terminó de asentar su fondo blanco) — revertimos lo que le
+        // habíamos forzado antes, si fuimos nosotros quienes lo tocamos
+        svg.style.removeProperty('fill');
+        svg.style.removeProperty('color');
+        svg.querySelectorAll('path, circle, rect, polygon, ellipse').forEach((p) => {
+          p.style.removeProperty('fill');
+        });
+        delete svg.dataset.eafitWhitened;
+      }
+    });
+  }
+
+  // 1. logo: usamos la versión blanca real que encontraste, reemplazando el src
+  const WHITE_LOGO_URL =
+    'https://mamutrojo.com/hs-fs/hubfs/assets/logos/Logo%20EAFIT%202015%20-%20Blanco%20(1).png?width=449&height=183&name=Logo%20EAFIT%202015%20-%20Blanco%20(1).png';
+  function fixLogo() {
+    deepQuerySelectorAll(document, 'img').forEach((img) => {
+      if (img.dataset.eafitLogoFixed) return;
+      const alt = (img.alt || '').toLowerCase();
+      const isLogo =
+        alt.includes('mi página de inicio') || // el alt real que usa D2L para el logo/link al home
+        alt.includes('mi pagina de inicio') ||
+        alt.includes('eafit') ||
+        alt.includes('universidad');
+      if (!isLogo) return;
+      img.src = WHITE_LOGO_URL;
+      img.style.removeProperty('filter'); // por si había quedado el invert de antes
+      img.dataset.eafitLogoFixed = '1';
+    });
+  }
+
+  // 2. cualquier TEXTO (no solo íconos) que esté flotando directo sobre
+  // nuestro fondo (sin ningún ancestro con fondo opaco) también lo pintamos
+  // blanco — esto agarra tu nombre, y cualquier otro texto suelto ahí arriba
+  let lastTextSummary = '';
+  let textDiagnosticLogsLeft = 10;
+  function whitenTextOverBackground() {
+    let pintados = 0;
+    let saltadosPorMenu = 0;
+    let saltadosPorFondoPropio = 0;
+
+    deepQuerySelectorAll(document, '*').forEach((el) => {
+      if (el.children.length !== 0) return; // solo hojas de texto puro
+      const text = el.textContent && el.textContent.trim();
+      if (!text) return;
+      if (hasFloatingMenuAncestor(el)) {
+        saltadosPorMenu++;
+        if (el.dataset.eafitTextWhitened) {
+          el.style.removeProperty('color');
+          delete el.dataset.eafitTextWhitened;
+        }
+        return;
+      }
+      const bg = findsOpaqueAncestorBg(el);
+      if (bg === null) {
+        pintados++;
+        el.style.setProperty('color', '#fff', 'important');
+        el.dataset.eafitTextWhitened = '1';
+      } else {
+        saltadosPorFondoPropio++;
+        if (el.dataset.eafitTextWhitened) {
+          // mismo caso: apareció un fondo opaco real (ej. un menú desplegable
+          // que recién terminó de asentar su fondo) — revertimos el blanco
+          el.style.removeProperty('color');
+          delete el.dataset.eafitTextWhitened;
+        }
+      }
+    });
+
+    // si algún texto vuelve a quedar ilegible, este resumen dice de una cuál de
+    // las tres ramas lo decidió, sin tener que inspeccionar el DOM a ciegas.
+    // Solo loggeamos cuando los números cambian (y con tope), para no inundar
+    // la consola: esta función corre en cada mutación del DOM.
+    const summary = `${pintados}/${saltadosPorMenu}/${saltadosPorFondoPropio}`;
+    if (summary !== lastTextSummary && textDiagnosticLogsLeft > 0) {
+      lastTextSummary = summary;
+      textDiagnosticLogsLeft--;
+      console.log(
+        '[EAFIT vaporwave] textos → pintados de blanco:', pintados,
+        '| saltados por ser menú/desplegable:', saltadosPorMenu,
+        '| saltados por tener fondo propio opaco:', saltadosPorFondoPropio
+      );
+    }
+  }
+
+  // 3. la barra negra (Tutoriales/Cursos.../Ayuda) la detectamos por ser un
+  // elemento ANCHO con un color de fondo muy oscuro, y la volvemos transparente
+  // — sus textos/íconos de adentro se fuerzan a blanco para seguir siendo
+  // legibles sobre el fondo vaporwave que queda a la vista
+  function fixDarkBar() {
+    deepQuerySelectorAll(document, '*').forEach((el) => {
+      if (el.dataset.eafitBarFixed) return;
+      const rect = el.getBoundingClientRect();
+      if (rect.width < window.innerWidth * 0.5 || rect.height < 20 || rect.height > 120) return;
+      const bgColor = getComputedStyle(el).backgroundColor;
+      const m = bgColor.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)(?:,\s*([\d.]+))?\)/);
+      if (!m) return;
+      const [, r, g, b, a] = m;
+      const alpha = a === undefined ? 1 : parseFloat(a);
+      const luminance = 0.299 * r + 0.587 * g + 0.114 * b;
+      if (alpha > 0.6 && luminance < 30) {
+        el.style.setProperty('background', 'transparent', 'important');
+        el.style.setProperty('background-color', 'transparent', 'important');
+        // sin esto, si la barra tenía su propio borde/sombra (no solo fondo),
+        // quedaba un recuadro finito visible aunque el fondo ya fuera transparente
+        el.style.setProperty('border', 'none', 'important');
+        el.style.setProperty('box-shadow', 'none', 'important');
+        el.style.setProperty('outline', 'none', 'important');
+        el.dataset.eafitBarFixed = '1';
+        deepQuerySelectorAll(el, '*').forEach((child) => {
+          if (child.children.length === 0 && child.textContent && child.textContent.trim()) {
+            child.style.setProperty('color', '#fff', 'important');
+          }
+        });
+        // el tema liquid-glass (si está instalado) le pone fondo de "píldora
+        // de vidrio" blanca a TODO botón/[role="button"] (Tutoriales, Ayuda,
+        // etc.). Su propio corrector de contraste decide si sacarla mirando
+        // si hay fondo oscuro detrás — pero como acabamos de volver esta
+        // barra transparente, ya no hay nada oscuro que detectar y la
+        // píldora se queda pegada. La sacamos nosotros directamente, ya que
+        // somos quienes sabemos que esta barra ahora es transparente.
+        deepQuerySelectorAll(el, 'button, [role="button"], .d2l-button, a.d2l-button').forEach((btn) => {
+          btn.style.setProperty('background', 'transparent', 'important');
+          btn.style.setProperty('background-color', 'transparent', 'important');
+          btn.style.setProperty('border', 'none', 'important');
+          btn.style.setProperty('box-shadow', 'none', 'important');
+          btn.style.setProperty('backdrop-filter', 'none', 'important');
+          btn.style.setProperty('-webkit-backdrop-filter', 'none', 'important');
+          btn.style.setProperty('outline', 'none', 'important');
+        });
+      }
+    });
+  }
+
+  // 4. cuando una materia no tiene contenido, el widget "Contenidos del curso"
+  // deja una caja grande vacía que nunca tuvo fondo propio (no es un wrapper
+  // que D2L pinte de blanco, simplemente no tiene background) — por eso se ve
+  // nuestro fondo vaporwave nítido "asomando" adentro de esa caja, duplicado
+  // respecto al fondo real de la página. La anclamos por el TEXTO del título
+  // del widget (mismo patrón que usa Utilidades.user para encontrar tarjetas
+  // sin depender de nombres de clase de D2L, que pueden cambiar) y le damos a
+  // la caja vacía de adentro un fondo translúcido con blur, como el resto de
+  // las tarjetas de vidrio, para que no se vea la imagen repetida.
+  function fixEmptyCourseContentArea() {
+    const heading = deepQuerySelectorAll(document, '*').find(
+      (el) => el.children.length === 0 && el.textContent && el.textContent.trim() === 'Contenidos del curso'
+    );
+    if (!heading) return;
+
+    // subimos hasta un contenedor razonablemente ancho (el widget completo),
+    // cruzando shadow DOM si hace falta
+    let widget = heading;
+    for (let i = 0; i < 10 && widget; i++) {
+      const rect = widget.getBoundingClientRect();
+      if (rect.width > 300) break;
+      widget = getParentAcrossShadow(widget);
+    }
+    if (!widget) return;
+
+    // adentro del widget, buscamos el primer contenedor grande que NO tenga
+    // ningún fondo propio (ni de nosotros, ni de D2L) — esa es la caja vacía
+    const candidate = deepQuerySelectorAll(widget, '*').find((el) => {
+      if (el.dataset.eafitEmptyAreaFixed) return false;
+      if (el === heading || el === widget) return false;
+      const rect = el.getBoundingClientRect();
+      if (rect.width < 200 || rect.height < 150) return false;
+      const bg = getComputedStyle(el).backgroundColor;
+      return !bg || bg === 'rgba(0, 0, 0, 0)' || bg === 'transparent';
+    });
+    if (!candidate) return;
+
+    candidate.style.setProperty('background', 'rgba(255, 255, 255, 0.35)', 'important');
+    candidate.style.setProperty('backdrop-filter', 'blur(40px)', 'important');
+    candidate.style.setProperty('-webkit-backdrop-filter', 'blur(40px)', 'important');
+    candidate.style.setProperty('border-radius', '12px', 'important');
+    candidate.dataset.eafitEmptyAreaFixed = '1';
+    console.log('[EAFIT vaporwave] caja vacía de "Contenidos del curso" tapada:', candidate.tagName, candidate.className);
+  }
+
+  function neutralizeWrapperBackgrounds() {
+    // esto es lo que faltaba: un estilo EN LÍNEA (no en una hoja de estilos) le
+    // gana a cualquier !important de CUALQUIER hoja de estilos, sin importar el
+    // orden en que Tampermonkey cargue los scripts. Si tenés el tema liquid
+    // glass instalado, su propia regla "html, body { background: #f5f7fa
+    // !important }" competía con la nuestra y a veces ganaba ella — esto la
+    // neutraliza directamente, siempre.
+    document.documentElement.style.setProperty('background', 'transparent', 'important');
+    if (document.body) document.body.style.setProperty('background', 'transparent', 'important');
+
+    // Adentro de un iframe paramos acá. Volverlo transparente es justo lo que
+    // hace falta para que se vea la foto de la página de atrás; en cambio el
+    // barrido de abajo mide "wrapper grande" contra window.innerWidth, que
+    // adentro de un iframe es el ancho DEL IFRAME — así agarraba tarjetas de
+    // contenido normales y las dejaba transparentes (tiles lavados).
+    if (!IS_TOP_FRAME) return;
+
+    let level = [document.body];
+    for (let depth = 0; depth < 4 && level.length; depth++) {
+      const next = [];
+      level.forEach((el) => {
+        if (!el || !el.children) return;
+        Array.from(el.children).forEach((child) => {
+          if (child.id === 'eafit-vaporwave-bg') return; // no tocarnos a nosotros mismos
+          // los menús desplegables (notificaciones, perfil) suelen insertarse
+          // como hijos directos de <body> con position fixed/absolute, y a
+          // veces son igual de "anchos y grandes" que un wrapper real de
+          // página — sin esta exclusión, los estábamos volviendo transparentes
+          // también, y por eso su texto (que sí tiene fondo blanco real detrás)
+          // se pintaba blanco sobre blanco.
+          const position = getComputedStyle(child).position;
+          if (position === 'fixed' || position === 'absolute') return;
+          const computed = getComputedStyle(child);
+          const bg = computed.backgroundColor;
+          const bgImage = computed.backgroundImage;
+          const isOpaque = bg && bg !== 'rgba(0, 0, 0, 0)' && bg !== 'transparent' && !/rgba?\([^)]*,\s*0\s*\)/.test(bg);
+          // Un wrapper también puede taparnos con un DEGRADADO (background-image),
+          // sin color de fondo — eso se le escapaba al chequeo de arriba y quedaba
+          // una capa blanca/gris encima de la foto. Solo limpiamos degradados: una
+          // imagen url(...) en un contenedor grande suele ser contenido real (ej. el
+          // banner de imagen del curso, #CourseImageBannerPlaceholderId) y esa NO se toca.
+          const hasGradient = bgImage && bgImage !== 'none' && bgImage.includes('gradient');
+          if (isOpaque || hasGradient) {
+            const rect = child.getBoundingClientRect();
+            const isBigWrapper =
+              rect.width > window.innerWidth * 0.6 &&
+              (rect.height > window.innerHeight * 0.3 || rect.height > 40);
+            if (isBigWrapper) {
+              child.style.setProperty('background', 'transparent', 'important');
+              child.style.setProperty('background-color', 'transparent', 'important');
+              if (hasGradient) {
+                child.style.setProperty('background-image', 'none', 'important');
+                console.log(
+                  '[EAFIT vaporwave] wrapper grande tapaba la foto con un degradado, se quitó:',
+                  child.tagName, child.className || '(sin clase)', '|', bgImage.slice(0, 80)
+                );
+              }
+            }
+          }
+          next.push(child);
+        });
+      });
+      level = next;
+    }
+  }
+  setInterval(neutralizeWrapperBackgrounds, 1000);
+
+  // el polling cada 1s no alcanza a tiempo — el fondo blanco aparece en
+  // milisegundos, justo cuando D2L termina de renderizar algún widget nuevo.
+  // Con un MutationObserver reaccionamos AL INSTANTE cada vez que se agrega
+  // algo al DOM, en vez de esperar hasta el próximo chequeo del intervalo.
+  // Agrupamos con requestAnimationFrame para correr una sola vez justo antes
+  // del próximo paint del navegador, no en cada mutación suelta (puede haber
+  // muchísimas seguidas).
+  // todo lo que hay que reaplicar junto, en un solo lugar (antes estaba repetido
+  // en tres lados y era fácil que se desincronizaran). Adentro de un iframe
+  // corremos solo lo que lo vuelve transparente y lo que arregla el contraste
+  // del texto: el resto (logo, barra oscura, blobs, caja vacía del widget) son
+  // cosas que solo existen en la página principal.
+  function runAllFixes() {
+    neutralizeWrapperBackgrounds();
+    whitenIconsOverBackground();
+    whitenTextOverBackground();
+    if (!IS_TOP_FRAME) return;
+    fixLogo();
+    fixDarkBar();
+    fixEmptyCourseContentArea();
+    hideLiquidGlassBlobs();
+  }
+
+  let rafScheduled = false;
+  const wrapperObserver = new MutationObserver(() => {
+    if (rafScheduled) return;
+    rafScheduled = true;
+    requestAnimationFrame(() => {
+      rafScheduled = false;
+      runAllFixes();
+    });
+  });
+  wrapperObserver.observe(document.documentElement, { childList: true, subtree: true });
+
+  if (document.body) {
+    injectBackground();
+    runAllFixes();
+  } else {
+    document.addEventListener('DOMContentLoaded', () => {
+      injectBackground();
+      runAllFixes();
+    });
+  }
+})();
