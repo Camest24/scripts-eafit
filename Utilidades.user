@@ -1,0 +1,1001 @@
+// ==UserScript==
+// @name         EAFIT D2L - Utilidades (añadidos)
+// @namespace    http://tampermonkey.net/
+// @version      1.0.0
+// @description  Script base para ir sumando pequeñas mejoras sueltas al D2L de EAFIT. Añadido #1: esconde el banner promocional de "nueva experiencia de contenidos".
+// @author       You
+// @match        https://interactivavirtual.eafit.edu.co/*
+// @grant        none
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  // ---- buscador que atraviesa Shadow DOM e iframes del mismo dominio ----
+  // (mismo helper que usamos en el script de descarga — varios widgets de EAFIT
+  // viven adentro de shadow DOM o de un iframe legacy, así que lo necesitamos acá también)
+  function deepQueryAll(root, selector) {
+    const results = [];
+    const stack = [root];
+    while (stack.length) {
+      const node = stack.pop();
+      if (!node || !node.querySelectorAll) continue;
+      results.push(...node.querySelectorAll(selector));
+      const all = node.querySelectorAll('*');
+      for (const el of all) {
+        if (el.shadowRoot) stack.push(el.shadowRoot);
+        if (el.tagName === 'IFRAME') {
+          try {
+            const doc = el.contentDocument;
+            if (doc) stack.push(doc);
+          } catch (e) {
+            // iframe de otro dominio, no podemos leerlo
+          }
+        }
+      }
+    }
+    return results;
+  }
+
+  // ---- utilidad genérica: esconder la "tarjeta" que contiene cierto texto ----
+  // Busca un nodo de texto con la frase indicada, y sube por los padres hasta
+  // encontrar uno que ya parezca el contenedor completo del widget (por tamaño),
+  // y lo esconde. Así no dependemos de adivinar nombres de clase de D2L.
+  const hiddenOnce = new Set();
+  function hideCardContainingText(needle, { minWidth = 250, minHeight = 80, maxLevels = 14 } = {}) {
+    if (hiddenOnce.has(needle)) return true; // ya lo escondimos antes, no hace falta re-buscar
+    const needleLower = needle.toLowerCase();
+    const candidates = deepQueryAll(document, '*');
+    let leafFound = false;
+    for (const el of candidates) {
+      if (el.children.length === 0 && el.textContent && el.textContent.toLowerCase().includes(needleLower)) {
+        leafFound = true;
+        let node = el;
+        for (let i = 0; i < maxLevels && node; i++) {
+          const rect = node.getBoundingClientRect();
+          if (rect.width >= minWidth && rect.height >= minHeight) {
+            node.style.setProperty('display', 'none', 'important');
+            hiddenOnce.add(needle);
+            console.log('[EAFIT utilidades] escondido (ancla:', JSON.stringify(needle), ') tamaño:', rect.width, 'x', rect.height);
+            return true;
+          }
+          node = node.parentElement;
+        }
+        console.log('[EAFIT utilidades] encontré el texto', JSON.stringify(needle), 'pero ningún ancestro (hasta', maxLevels, 'niveles) llegó al tamaño mínimo', minWidth, 'x', minHeight);
+      }
+    }
+    if (!leafFound) {
+      console.log('[EAFIT utilidades] no encontré NINGÚN nodo con el texto:', JSON.stringify(needle));
+    }
+    return false;
+  }
+
+  // ---------- Añadido #1: esconder el banner de "nueva experiencia de contenidos" ----------
+  // Resultó ser un <iframe> que carga contenido de Genially (view.genial.ly), un
+  // servicio externo — por eso nunca lo encontrábamos buscando texto: es contenido
+  // de OTRO dominio, y el navegador no deja leer adentro de un iframe cross-origin
+  // por seguridad (ni con userscript ni con nada). Pero el <iframe> en sí (la
+  // etiqueta) SÍ vive en la página de EAFIT y es visible — le apuntamos directo a eso.
+
+  // sube por los padres, pero cruzando los límites de Shadow DOM correctamente:
+  // node.parentElement da null en la raíz de un shadow root (ahí el "padre" real
+  // se pide con shadowRoot.host, no con parentElement) — sin esto la subida se
+  // cortaba justo al llegar al borde del shadow root, mucho antes de llegar al
+  // widget completo.
+  function getParentAcrossShadow(node) {
+    if (node.parentElement) return node.parentElement;
+    const root = node.getRootNode();
+    if (root && root.host) return root.host;
+    return null;
+  }
+
+  // constantes y helpers compartidos por TODOS los añadidos — van acá arriba,
+  // antes de cualquier runAddonN(), porque un const no está disponible hasta que
+  // el código pasa por su línea de declaración (a diferencia de las funciones,
+  // que sí quedan disponibles desde el principio). Tenerlos más abajo rompía TODO
+  // el script apenas cargaba, antes de siquiera llegar al calendario.
+  const MONTHS_ES = [
+    'enero', 'febrero', 'marzo', 'abril', 'mayo', 'junio',
+    'julio', 'agosto', 'septiembre', 'octubre', 'noviembre', 'diciembre',
+  ];
+  const CAL_COLORS = ['#ff5b5b', '#ffb020', '#3ecf6b', '#3f8cff', '#b45bff', '#ff7fc9'];
+  const CAL_STORAGE_KEY = 'eafit-cal-events';
+  const COURSE_COLOR_KEY = 'eafit-cal-course-colors'; // color fijo por materia, para que sea consistente entre eventos
+  const COURSE_ORDER_KEY = 'eafit-cal-course-order'; // posición fija y permanente de cada materia, para que el color no colisione
+
+  // tolera <br>/<span>/etc (puro formato de texto) al matchear un texto que puede
+  // venir partido en varias líneas con un salto de línea real en el HTML
+  const TEXT_ONLY_TAGS = new Set(['BR', 'B', 'STRONG', 'EM', 'I', 'SPAN', 'SMALL']);
+  function isPureTextContainer(el) {
+    for (const child of el.children) {
+      if (!TEXT_ONLY_TAGS.has(child.tagName)) return false;
+      if (!isPureTextContainer(child)) return false;
+    }
+    return true;
+  }
+
+  function runAddon1() {
+    if (hiddenOnce.has('addon1')) return;
+    const iframes = deepQueryAll(document, 'iframe[src*="genial.ly"], iframe[title*="Banner"]');
+    for (const iframe of iframes) {
+      // subimos hasta el widget contenedor (role="region") para esconder la tarjeta
+      // completa, no solo el iframe (si no, puede quedar un hueco/borde vacío)
+      let node = iframe;
+      let wrapper = null;
+      for (let i = 0; i < 20 && node; i++) {
+        if (node.getAttribute && node.getAttribute('role') === 'region') {
+          wrapper = node;
+          break;
+        }
+        node = getParentAcrossShadow(node);
+      }
+      (wrapper || iframe).style.setProperty('display', 'none', 'important');
+      hiddenOnce.add('addon1');
+      console.log('[EAFIT utilidades] escondido el banner de Genially', wrapper ? '(widget completo)' : '(solo el iframe)');
+      return;
+    }
+  }
+
+  // D2L es un SPA: el banner puede tardar en cargar o volver a aparecer al navegar,
+  // así que reintentamos cada 1.2s (una vez escondido, hiddenOnce hace que no vuelva
+  // a intentar buscarlo — barato de correr en cada tick).
+  runAddon1();
+  setInterval(runAddon1, 1200);
+
+  // ---------- Añadido #2: esconder toda la barra de tabs de semestres y "Ver todos los cursos" ----------
+  // Ya no queremos NINGÚN tab (ni siquiera "2026-2", es redundante si es el único que
+  // queda) — así que en vez de esconder cada texto suelto, escondemos el contenedor
+  // completo que los agrupa, para que no quede la línea divisoria ni el espacio vacío.
+
+  function runAddon2() {
+    if (hiddenOnce.has('addon2')) return;
+    const exactTargets = new Set(['Todos', '2025-2', '2026-1', '2026-2']);
+    const candidates = deepQueryAll(document, 'a, button, span, div, li');
+    let tabContainer = null;
+    let verTodosHidden = false;
+
+    for (const el of candidates) {
+      if (el.children.length !== 0) continue; // solo nodos hoja de texto
+      const text = el.textContent.trim();
+
+      if (exactTargets.has(text)) {
+        const clickable = (el.closest && el.closest('a, button, [role="tab"], [role="button"]')) || el;
+        // el contenedor que agrupa los tabs es el padre compartido de todos ellos
+        tabContainer = getParentAcrossShadow(clickable) || tabContainer;
+      } else if (/^Ver todos los cursos/.test(text)) {
+        const target = (el.closest && el.closest('a, button, [role="button"]')) || el;
+        target.style.setProperty('display', 'none', 'important');
+        verTodosHidden = true;
+      }
+    }
+
+    if (tabContainer) {
+      tabContainer.style.setProperty('display', 'none', 'important');
+    }
+    if (tabContainer && verTodosHidden) hiddenOnce.add('addon2');
+  }
+
+  runAddon2();
+  setInterval(runAddon2, 1200);
+
+  // ---------- Añadido #4: esconder "Ver próximos eventos" ----------
+  function runAddon4() {
+    if (hiddenOnce.has('addon4')) return;
+    const candidates = deepQueryAll(document, 'a, button, span, div');
+    for (const el of candidates) {
+      if (!isPureTextContainer(el)) continue;
+      if (el.textContent.trim().replace(/\s+/g, ' ') !== 'Ver próximos eventos') continue;
+      const target = (el.closest && el.closest('a, button, [role="button"]')) || el;
+      target.style.setProperty('display', 'none', 'important');
+      hiddenOnce.add('addon4');
+      return;
+    }
+  }
+  runAddon4();
+  setInterval(runAddon4, 1200);
+
+  // ---------- Añadido #5: "EAFIT+" — un + al lado del logo ----------
+  function addPlusBadge(el, asChild) {
+    const badge = document.createElement('span');
+    badge.textContent = '+';
+    Object.assign(badge.style, {
+      fontWeight: '900', fontSize: '20px', color: '#0a84ff',
+      marginLeft: '2px', verticalAlign: 'middle', lineHeight: '1',
+    });
+    if (asChild) el.appendChild(badge);
+    else el.insertAdjacentElement('afterend', badge);
+  }
+
+  function runAddon5() {
+    if (hiddenOnce.has('addon5')) return;
+
+    // intento 1: el logo como <img> con alt que mencione EAFIT
+    const logos = deepQueryAll(document, 'img[alt*="EAFIT" i]');
+    for (const logo of logos) {
+      addPlusBadge(logo, false);
+      hiddenOnce.add('addon5');
+      return;
+    }
+
+    // intento 2: "EAFIT" como texto real (tolerando <br>/span, por si está partido)
+    const candidates = deepQueryAll(document, '*');
+    for (const el of candidates) {
+      if (!isPureTextContainer(el)) continue;
+      if (el.textContent.trim().replace(/\s+/g, ' ').toUpperCase() !== 'EAFIT') continue;
+      addPlusBadge(el, true);
+      hiddenOnce.add('addon5');
+      return;
+    }
+  }
+  runAddon5();
+  setInterval(runAddon5, 1200);
+
+  // ---------- Añadido #6: que "Calendario" arranque siempre abierto ----------
+  // DESACTIVADO por ahora: forzar el atributo "expanded" por JS hace que el
+  // widget se vea abierto pero SIN cargar su contenido (hay que darle F5 para que
+  // funcione) — probablemente D2L necesita pasar por su propio ciclo de apertura
+  // (algún evento interno) para disparar la carga de datos, y saltearlo con JS
+  // rompe eso. Dejo el código comentado por si en el futuro encontramos la forma
+  // correcta de disparar esa carga (ej. simulando un click real en vez de setear
+  // el atributo directo).
+  //
+  // function runAddon6() {
+  //   const container = findContainerByText('Calendario');
+  //   if (!container) return;
+  //   const expandEls = deepQueryAll(container, '*').filter(
+  //     (el) => el.tagName && el.tagName.toLowerCase().includes('expand-collapse')
+  //   );
+  //   expandEls.forEach((el) => {
+  //     if (!el.hasAttribute('expanded')) el.setAttribute('expanded', '');
+  //   });
+  // }
+  // runAddon6();
+  // setInterval(runAddon6, 1200);
+
+  // ---------- Añadido #3: eventos propios en el mini-calendario ----------
+  // Click en un día -> modal con texto + color -> se guarda en localStorage (queda
+  // guardado aunque cierres el navegador) y el día queda pintado con ese color.
+
+  // lee los nombres reales de tus materias desde "Mis cursos" (mismo patrón que
+  // usamos en el script de descarga: los links de las tarjetas de curso apuntan a
+  // /d2l/home/{id} y traen el nombre como texto). Recortamos en la primera coma
+  // porque algunas tarjetas traen el link envolviendo TODO el contenido (nombre,
+  // código, término, fecha) como un solo texto separado por comas.
+  function getEnrolledCourseNames() {
+    const anchors = deepQueryAll(document, 'a[href*="/d2l/home/"]');
+    const names = new Set();
+    anchors.forEach((a) => {
+      const text = a.textContent.trim();
+      if (!text) return;
+      const shortName = text.split(',')[0].trim();
+      if (shortName) names.add(shortName);
+    });
+    return Array.from(names);
+  }
+
+  function loadCourseColors() {
+    try {
+      return JSON.parse(localStorage.getItem(COURSE_COLOR_KEY) || '{}');
+    } catch (e) {
+      return {};
+    }
+  }
+  function saveCourseColors(map) {
+    localStorage.setItem(COURSE_COLOR_KEY, JSON.stringify(map));
+  }
+  function loadCourseOrder() {
+    try {
+      return JSON.parse(localStorage.getItem(COURSE_ORDER_KEY) || '[]');
+    } catch (e) {
+      return [];
+    }
+  }
+  function saveCourseOrder(arr) {
+    localStorage.setItem(COURSE_ORDER_KEY, JSON.stringify(arr));
+  }
+
+  // busca un contenedor por texto exacto (igual que hideCardContainingText, pero
+  // sin esconderlo — lo necesitamos para saber DÓNDE está el widget de Calendario)
+  function findContainerByText(text, { minWidth = 200, minHeight = 100, maxLevels = 14 } = {}) {
+    const candidates = deepQueryAll(document, '*');
+    for (const el of candidates) {
+      if (el.children.length === 0 && el.textContent.trim() === text) {
+        let node = el;
+        for (let i = 0; i < maxLevels && node; i++) {
+          const rect = node.getBoundingClientRect();
+          if (rect.width >= minWidth && rect.height >= minHeight) return node;
+          node = getParentAcrossShadow(node);
+        }
+      }
+    }
+    return null;
+  }
+
+  function parseMonthHeader(container) {
+    const candidates = deepQueryAll(container, '*');
+    for (const el of candidates) {
+      if (el.children.length !== 0) continue;
+      const t = el.textContent.trim().toLowerCase();
+      const m = t.match(/^([a-záéíóúñ]+)\s+(\d{4})$/i);
+      if (m && MONTHS_ES.includes(m[1])) {
+        return { month: MONTHS_ES.indexOf(m[1]), year: parseInt(m[2], 10) };
+      }
+    }
+    return null;
+  }
+
+  function getDayCells(container) {
+    const containerRect = container.getBoundingClientRect();
+    return deepQueryAll(container, '*').filter((el) => {
+      if (el.children.length !== 0 || !/^\d{1,2}$/.test(el.textContent.trim())) return false;
+      const r = el.getBoundingClientRect();
+      // descartamos celdas de OTROS meses que D2L a veces pre-renderiza ocultos
+      // (para animar el deslizamiento al cambiar de mes) — si no filtramos esto,
+      // un evento del 11 de septiembre terminaba "pintándose" también en el 11 de
+      // cualquier otro mes pre-renderizado fuera de vista.
+      return r.width > 0 && r.height > 0 && r.left >= containerRect.left - 5 && r.right <= containerRect.right + 5;
+    });
+  }
+
+  // a cada celda le asigna su fecha real, detectando cuándo la grilla "pisa" al mes
+  // anterior (días grises al principio) o al mes siguiente (después de que el número
+  // vuelve a bajar) — igual que cualquier calendario de 6 semanas
+  function assignDatesToCells(cells, headerMonth, headerYear) {
+    let seenFirstOne = false;
+    let offset = -1;
+    let prevVal = null;
+    return cells.map((cell) => {
+      const val = parseInt(cell.textContent.trim(), 10);
+      if (!seenFirstOne) {
+        if (val === 1) {
+          seenFirstOne = true;
+          offset = 0;
+        }
+      } else if (prevVal !== null && val < prevVal) {
+        offset = 1;
+      }
+      prevVal = val;
+      return { cell, date: new Date(headerYear, headerMonth + offset, val) };
+    });
+  }
+
+  function dateKey(d) {
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  }
+
+  function loadCalEvents() {
+    try {
+      const raw = JSON.parse(localStorage.getItem(CAL_STORAGE_KEY) || '{}');
+      // migración: versiones viejas guardaban UN evento por día (un objeto),
+      // ahora guardamos una LISTA por día (por si hay más de uno el mismo día)
+      let migrated = false;
+      Object.keys(raw).forEach((k) => {
+        if (!Array.isArray(raw[k])) {
+          raw[k] = [raw[k]];
+          migrated = true;
+        }
+      });
+      if (migrated) localStorage.setItem(CAL_STORAGE_KEY, JSON.stringify(raw));
+      return raw;
+    } catch (e) {
+      return {};
+    }
+  }
+  function saveCalEvents(events) {
+    localStorage.setItem(CAL_STORAGE_KEY, JSON.stringify(events));
+  }
+
+  function openEventModal(date, existing, onSave, onDelete) {
+    const old = document.getElementById('eafit-cal-modal');
+    if (old) old.remove();
+
+    const overlay = document.createElement('div');
+    overlay.id = 'eafit-cal-modal';
+    Object.assign(overlay.style, {
+      position: 'fixed', inset: '0', background: 'rgba(0,0,0,.4)', zIndex: 999999,
+      display: 'flex', alignItems: 'center', justifyContent: 'center',
+      fontFamily: 'Arial, sans-serif',
+    });
+
+    const box = document.createElement('div');
+    Object.assign(box.style, {
+      background: '#fff', borderRadius: '12px', padding: '20px', width: '280px',
+      boxShadow: '0 10px 40px rgba(0,0,0,.3)',
+    });
+
+    const title = document.createElement('div');
+    title.textContent = date.toLocaleDateString('es-CO', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' });
+    Object.assign(title.style, { fontWeight: '700', marginBottom: '10px', fontSize: '14px', color: '#111' });
+
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.placeholder = 'Título del evento';
+    input.value = existing ? existing.text : '';
+    Object.assign(input.style, {
+      width: '100%', padding: '8px', marginBottom: '10px', border: '1px solid #ccc',
+      borderRadius: '6px', boxSizing: 'border-box', fontSize: '14px', color: '#111',
+    });
+
+    const courseColors = loadCourseColors();
+    const enrolledCourses = getEnrolledCourseNames();
+    // en vez de un hash (que puede hacer que dos materias distintas caigan en el
+    // mismo color de las 6 disponibles), le damos a cada materia una POSICIÓN FIJA
+    // Y PERMANENTE la primera vez que la vemos (guardada en orden, solo se agrega al
+    // final, nunca se reordena) — así con 6 materias y 6 colores, nunca se repiten.
+    let courseOrder = loadCourseOrder();
+    let orderChanged = false;
+    enrolledCourses.forEach((name) => {
+      if (!courseOrder.includes(name)) {
+        courseOrder.push(name);
+        orderChanged = true;
+      }
+    });
+    if (orderChanged) saveCourseOrder(courseOrder);
+
+    let coursesChanged = false;
+    enrolledCourses.forEach((name) => {
+      const idx = courseOrder.indexOf(name);
+      const fixedColor = CAL_COLORS[idx % CAL_COLORS.length];
+      if (courseColors[name] !== fixedColor) {
+        courseColors[name] = fixedColor;
+        coursesChanged = true;
+      }
+    });
+    if (coursesChanged) saveCourseColors(courseColors);
+
+    const materiaLabel = document.createElement('div');
+    Object.assign(materiaLabel.style, { fontSize: '12px', color: '#666', marginBottom: '4px', display: 'flex', alignItems: 'center', gap: '6px' });
+    const materiaLabelText = document.createElement('span');
+    materiaLabelText.textContent = 'Materia';
+    const colorPreviewDot = document.createElement('span');
+    Object.assign(colorPreviewDot.style, { width: '10px', height: '10px', borderRadius: '50%', display: 'none' });
+    materiaLabel.appendChild(materiaLabelText);
+    materiaLabel.appendChild(colorPreviewDot);
+
+    const materiaSelect = document.createElement('select');
+    Object.assign(materiaSelect.style, {
+      width: '100%', padding: '8px', marginBottom: '12px', border: '1px solid #ccc',
+      borderRadius: '6px', boxSizing: 'border-box', fontSize: '14px', color: '#111', background: '#fff',
+    });
+    const emptyOpt = document.createElement('option');
+    emptyOpt.value = '';
+    emptyOpt.textContent = '(sin materia)';
+    materiaSelect.appendChild(emptyOpt);
+    enrolledCourses.forEach((name) => {
+      const opt = document.createElement('option');
+      opt.value = name;
+      opt.textContent = name;
+      materiaSelect.appendChild(opt);
+    });
+    materiaSelect.value = existing && existing.materia && enrolledCourses.includes(existing.materia) ? existing.materia : '';
+
+    const colorRow = document.createElement('div');
+    Object.assign(colorRow.style, { display: 'flex', gap: '8px', marginBottom: '14px', alignItems: 'center' });
+    let selectedColor = existing ? existing.color : CAL_COLORS[0];
+    const applySwatchStyle = (sw, c, isSelected) => {
+      // con !important porque si tenés instalado el tema visual (liquid glass, etc.)
+      // le pone background:...!important a TODOS los <button> de la página, y eso
+      // le ganaba al color en línea normal, dejando los círculos en blanco
+      sw.style.setProperty('background', c, 'important');
+      sw.style.setProperty('border', isSelected ? '3px solid #000' : '2px solid #fff', 'important');
+      sw.style.setProperty('border-radius', '50%', 'important');
+      sw.style.setProperty('width', '26px', 'important');
+      sw.style.setProperty('height', '26px', 'important');
+      sw.style.setProperty('padding', '0', 'important');
+      sw.style.setProperty('cursor', 'pointer', 'important');
+    };
+    const swatches = CAL_COLORS.map((c) => {
+      const sw = document.createElement('button');
+      applySwatchStyle(sw, c, c === selectedColor);
+      sw.addEventListener('click', () => {
+        selectedColor = c;
+        swatches.forEach((s, i) => applySwatchStyle(s, CAL_COLORS[i], CAL_COLORS[i] === selectedColor));
+      });
+      colorRow.appendChild(sw);
+      return sw;
+    });
+
+    // si elegís una materia, el color es automático (el que le corresponde a esa
+    // materia) y escondemos los círculos manuales — solo se eligen a mano cuando
+    // el evento no tiene materia asociada
+    function syncColorWithMateria() {
+      const val = materiaSelect.value;
+      if (val && courseColors[val]) {
+        selectedColor = courseColors[val];
+        colorRow.style.setProperty('display', 'none', 'important');
+        colorPreviewDot.style.setProperty('background', selectedColor, 'important');
+        colorPreviewDot.style.display = 'inline-block';
+      } else {
+        colorRow.style.setProperty('display', 'flex', 'important');
+        colorPreviewDot.style.display = 'none';
+        swatches.forEach((s, i) => applySwatchStyle(s, CAL_COLORS[i], CAL_COLORS[i] === selectedColor));
+      }
+    }
+    materiaSelect.addEventListener('change', syncColorWithMateria);
+    syncColorWithMateria();
+
+    if (existing) {
+      const delBtn = document.createElement('button');
+      delBtn.textContent = 'Eliminar evento';
+      delBtn.style.setProperty('width', '100%', 'important');
+      delBtn.style.setProperty('padding', '8px', 'important');
+      delBtn.style.setProperty('margin-bottom', '10px', 'important');
+      delBtn.style.setProperty('border', 'none', 'important');
+      delBtn.style.setProperty('border-radius', '6px', 'important');
+      delBtn.style.setProperty('background', '#ffe1e1', 'important');
+      delBtn.style.setProperty('color', '#c0392b', 'important');
+      delBtn.style.setProperty('cursor', 'pointer', 'important');
+      delBtn.style.setProperty('font-weight', '600', 'important');
+      delBtn.style.setProperty('font-size', '13px', 'important');
+      delBtn.addEventListener('click', () => {
+        onDelete();
+        overlay.remove();
+      });
+      box.appendChild(title);
+      box.appendChild(input);
+      box.appendChild(materiaLabel);
+      box.appendChild(materiaSelect);
+      box.appendChild(colorRow);
+      box.appendChild(delBtn);
+    } else {
+      box.appendChild(title);
+      box.appendChild(input);
+      box.appendChild(materiaLabel);
+      box.appendChild(materiaSelect);
+      box.appendChild(colorRow);
+    }
+
+    const saveBtn = document.createElement('button');
+    saveBtn.textContent = 'Guardar';
+    saveBtn.style.setProperty('display', 'block', 'important');
+    saveBtn.style.setProperty('width', '100%', 'important');
+    saveBtn.style.setProperty('padding', '10px', 'important');
+    saveBtn.style.setProperty('margin-bottom', '8px', 'important');
+    saveBtn.style.setProperty('border', 'none', 'important');
+    saveBtn.style.setProperty('border-radius', '6px', 'important');
+    saveBtn.style.setProperty('background', '#0a84ff', 'important');
+    saveBtn.style.setProperty('color', '#fff', 'important');
+    saveBtn.style.setProperty('cursor', 'pointer', 'important');
+    saveBtn.style.setProperty('font-weight', '700', 'important');
+    saveBtn.style.setProperty('font-size', '14px', 'important');
+    saveBtn.addEventListener('click', () => {
+      if (!input.value.trim()) {
+        overlay.remove();
+        return;
+      }
+      onSave(input.value.trim(), selectedColor, materiaSelect.value.trim());
+      overlay.remove();
+    });
+
+    const cancelBtn = document.createElement('button');
+    cancelBtn.textContent = 'Cancelar';
+    cancelBtn.style.setProperty('display', 'block', 'important');
+    cancelBtn.style.setProperty('width', '100%', 'important');
+    cancelBtn.style.setProperty('padding', '8px', 'important');
+    cancelBtn.style.setProperty('border', '1px solid #ccc', 'important');
+    cancelBtn.style.setProperty('border-radius', '6px', 'important');
+    cancelBtn.style.setProperty('background', '#fff', 'important');
+    cancelBtn.style.setProperty('cursor', 'pointer', 'important');
+    cancelBtn.style.setProperty('font-size', '13px', 'important');
+    cancelBtn.style.setProperty('color', '#111', 'important');
+    cancelBtn.addEventListener('click', () => overlay.remove());
+
+    box.appendChild(saveBtn);
+    box.appendChild(cancelBtn);
+    overlay.appendChild(box);
+    document.body.appendChild(overlay);
+    input.focus();
+
+    // si tocás afuera del modal sin querer, antes de tirar todo a la basura
+    // preguntamos si en verdad querés descartar lo que escribiste
+    overlay.addEventListener('click', (e) => {
+      if (e.target !== overlay) return;
+      const hasUnsavedText = input.value.trim() && input.value.trim() !== (existing ? existing.text : '');
+      if (hasUnsavedText && !confirm('¿Descartar el evento que estabas escribiendo?')) return;
+      overlay.remove();
+    });
+  }
+
+  // lista de eventos de UN día (para cuando hay más de uno): cada fila con su
+  // punto de color, texto, y botones de editar/borrar; más un botón para agregar
+  // otro evento ese mismo día
+  function openDayEventsList(date, key, dayList, onAddNew) {
+    const old = document.getElementById('eafit-cal-modal');
+    if (old) old.remove();
+
+    const overlay = document.createElement('div');
+    overlay.id = 'eafit-cal-modal';
+    Object.assign(overlay.style, {
+      position: 'fixed', inset: '0', background: 'rgba(0,0,0,.4)', zIndex: 999999,
+      display: 'flex', alignItems: 'center', justifyContent: 'center',
+      fontFamily: 'Arial, sans-serif',
+    });
+
+    const box = document.createElement('div');
+    Object.assign(box.style, {
+      background: '#fff', borderRadius: '12px', padding: '20px', width: '300px',
+      boxShadow: '0 10px 40px rgba(0,0,0,.3)',
+    });
+
+    const title = document.createElement('div');
+    title.textContent = date.toLocaleDateString('es-CO', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' });
+    Object.assign(title.style, { fontWeight: '700', marginBottom: '12px', fontSize: '14px', color: '#111' });
+    box.appendChild(title);
+
+    function reopen() {
+      // vuelve a abrir la lista actualizada, leyendo de nuevo del storage
+      const fresh = loadCalEvents()[key] || [];
+      overlay.remove();
+      if (fresh.length === 0) {
+        onAddNew();
+      } else {
+        openDayEventsList(date, key, fresh, onAddNew);
+      }
+    }
+
+    dayList.forEach((ev, i) => {
+      const row = document.createElement('div');
+      Object.assign(row.style, {
+        display: 'flex', alignItems: 'center', gap: '8px', padding: '8px',
+        border: '1px solid #eee', borderRadius: '8px', marginBottom: '8px',
+      });
+      const dot = document.createElement('span');
+      Object.assign(dot.style, { width: '10px', height: '10px', borderRadius: '50%', background: ev.color, flexShrink: '0' });
+      const label = document.createElement('span');
+      Object.assign(label.style, { flex: '1', fontSize: '13px', color: '#111' });
+      label.textContent = ev.materia ? `${ev.materia}: ${ev.text}` : ev.text;
+
+      const editBtn = document.createElement('button');
+      editBtn.textContent = '✏️';
+      editBtn.title = 'Editar';
+      editBtn.style.setProperty('border', 'none', 'important');
+      editBtn.style.setProperty('background', 'transparent', 'important');
+      editBtn.style.setProperty('cursor', 'pointer', 'important');
+      editBtn.style.setProperty('font-size', '14px', 'important');
+      editBtn.addEventListener('click', () => {
+        overlay.remove();
+        openEventModal(
+          date,
+          ev,
+          (text, color, materia) => {
+            const all = loadCalEvents();
+            const arr = all[key] || [];
+            arr[i] = { text, color, materia: materia || undefined };
+            all[key] = arr;
+            saveCalEvents(all);
+            if (materia) {
+              const colors = loadCourseColors();
+              colors[materia] = color;
+              saveCourseColors(colors);
+            }
+            runAddon3();
+          },
+          () => {
+            const all = loadCalEvents();
+            const arr = all[key] || [];
+            arr.splice(i, 1);
+            if (arr.length === 0) delete all[key];
+            else all[key] = arr;
+            saveCalEvents(all);
+            runAddon3();
+          }
+        );
+      });
+
+      row.appendChild(dot);
+      row.appendChild(label);
+      row.appendChild(editBtn);
+      box.appendChild(row);
+    });
+
+    const addBtn = document.createElement('button');
+    addBtn.textContent = '+ Agregar otro evento';
+    addBtn.style.setProperty('display', 'block', 'important');
+    addBtn.style.setProperty('width', '100%', 'important');
+    addBtn.style.setProperty('padding', '10px', 'important');
+    addBtn.style.setProperty('margin-top', '4px', 'important');
+    addBtn.style.setProperty('margin-bottom', '8px', 'important');
+    addBtn.style.setProperty('border', '1px dashed #999', 'important');
+    addBtn.style.setProperty('border-radius', '6px', 'important');
+    addBtn.style.setProperty('background', '#fff', 'important');
+    addBtn.style.setProperty('cursor', 'pointer', 'important');
+    addBtn.style.setProperty('font-size', '13px', 'important');
+    addBtn.style.setProperty('color', '#111', 'important');
+    addBtn.addEventListener('click', () => {
+      overlay.remove();
+      onAddNew();
+    });
+    box.appendChild(addBtn);
+
+    const cancelBtn = document.createElement('button');
+    cancelBtn.textContent = 'Cerrar';
+    cancelBtn.style.setProperty('display', 'block', 'important');
+    cancelBtn.style.setProperty('width', '100%', 'important');
+    cancelBtn.style.setProperty('padding', '8px', 'important');
+    cancelBtn.style.setProperty('border', '1px solid #ccc', 'important');
+    cancelBtn.style.setProperty('border-radius', '6px', 'important');
+    cancelBtn.style.setProperty('background', '#fff', 'important');
+    cancelBtn.style.setProperty('cursor', 'pointer', 'important');
+    cancelBtn.style.setProperty('font-size', '13px', 'important');
+    cancelBtn.style.setProperty('color', '#111', 'important');
+    cancelBtn.addEventListener('click', () => overlay.remove());
+    box.appendChild(cancelBtn);
+
+    overlay.appendChild(box);
+    document.body.appendChild(overlay);
+    overlay.addEventListener('click', (e) => {
+      if (e.target === overlay) overlay.remove();
+    });
+  }
+
+  // busca un nodo de puro-texto (tolera <br>/span, no solo hojas estrictas) con
+  // texto EXACTO (ignorando saltos de línea) en cualquier parte, shadow DOM/iframe incluido
+  function findLeafByText(text) {
+    const normalized = text.trim();
+    const candidates = deepQueryAll(document, '*');
+    for (const el of candidates) {
+      if (!isPureTextContainer(el)) continue;
+      const t = el.textContent.trim().replace(/\s+/g, ' ');
+      if (t === normalized || t === normalized + '.') return el;
+    }
+    return null;
+  }
+
+  // busca un contenedor razonable subiendo desde un elemento ya conocido (no desde
+  // texto) — lo usamos para encontrar la "cajita" alrededor de un heading puntual
+  function climbToContainer(el, { minWidth = 150, minHeight = 40, maxLevels = 10 } = {}) {
+    let node = el;
+    for (let i = 0; i < maxLevels && node; i++) {
+      const rect = node.getBoundingClientRect();
+      if (rect.width >= minWidth && rect.height >= minHeight) return node;
+      node = getParentAcrossShadow(node);
+    }
+    return null;
+  }
+
+  // llena el panel "Eventos para [día] de [mes]" (el que cambia según qué día
+  // clickeás en el calendario nativo de D2L) con el evento guardado para esa fecha
+  function renderSelectedDayPanel() {
+    const candidates = deepQueryAll(document, '*');
+    let headingEl = null;
+    let dayNum = null;
+    let monthName = null;
+    for (const el of candidates) {
+      if (!isPureTextContainer(el)) continue; // tolera <br>/<span>/etc, igual que con los títulos de contenido
+      const m = el.textContent.trim().replace(/\s+/g, ' ').match(/^Eventos para (\d{1,2}) de ([a-záéíóúñ]+)$/i);
+      if (m) {
+        headingEl = el;
+        dayNum = parseInt(m[1], 10);
+        monthName = m[2].toLowerCase();
+        break;
+      }
+    }
+    if (!headingEl) {
+      console.log('[EAFIT utilidades] renderSelectedDayPanel: no encontré el heading "Eventos para X de Y"');
+      return;
+    }
+    const monthIdx = MONTHS_ES.indexOf(monthName);
+    if (monthIdx === -1) {
+      console.log('[EAFIT utilidades] renderSelectedDayPanel: no reconocí el mes:', JSON.stringify(monthName));
+      return;
+    }
+
+    // para el año usamos el mismo que esté mostrando el calendario grande (si lo
+    // encontramos), si no el año actual
+    const calContainer = findContainerByText('Calendario');
+    const calHeader = calContainer ? parseMonthHeader(calContainer) : null;
+    const year = calHeader ? calHeader.year : new Date().getFullYear();
+
+    const key = dateKey(new Date(year, monthIdx, dayNum));
+    const allEvents = loadCalEvents();
+    const dayList = allEvents[key] || [];
+    console.log('[EAFIT utilidades] renderSelectedDayPanel: día', dayNum, monthName, year, '-> key', key, '-> eventos:', dayList);
+
+    // buscamos la cajita "No hay eventos para mostrar" DE ESTE panel puntual (no
+    // la de "Próximos eventos", que es otra). En vez de subir por TAMAÑO (que se
+    // conformaba con un ancestro chico que no llegaba a incluir la cajita, quedándose
+    // corto), subimos paso a paso comprobando en cada nivel si el placeholder ya
+    // está adentro — así no importa cuán grande sea el contenedor real.
+    let widget = headingEl;
+    let placeholder = null;
+    for (let i = 0; i < 14 && widget && !placeholder; i++) {
+      for (const el of deepQueryAll(widget, '*')) {
+        if (!isPureTextContainer(el)) continue;
+        const t = el.textContent.trim().replace(/\s+/g, ' ');
+        if (t === 'No hay eventos para mostrar' || t === 'No hay eventos para mostrar.') {
+          placeholder = el;
+          break;
+        }
+      }
+      if (!placeholder) widget = getParentAcrossShadow(widget);
+    }
+    if (!placeholder) {
+      console.log('[EAFIT utilidades] renderSelectedDayPanel: no encontré el placeholder subiendo desde el heading (probé 14 niveles)');
+      return;
+    }
+
+    let listEl = document.getElementById('eafit-cal-day-panel-list');
+    if (!listEl) {
+      if (!placeholder) {
+        console.log('[EAFIT utilidades] renderSelectedDayPanel: no encontré el placeholder "No hay eventos para mostrar" dentro del widget');
+        return;
+      }
+      let box = placeholder;
+      for (let i = 0; i < 6 && box; i++) {
+        const rect = box.getBoundingClientRect();
+        if (rect.width > 100 && rect.height > 25) break;
+        box = getParentAcrossShadow(box);
+      }
+      if (!box) {
+        console.log('[EAFIT utilidades] renderSelectedDayPanel: encontré el placeholder pero no un box de tamaño razonable subiendo desde él');
+        return;
+      }
+      listEl = document.createElement('div');
+      listEl.id = 'eafit-cal-day-panel-list';
+      Object.assign(listEl.style, { display: 'flex', flexDirection: 'column', gap: '6px' });
+      box.insertAdjacentElement('afterend', listEl);
+      listEl.__placeholderBox = box;
+      console.log('[EAFIT utilidades] renderSelectedDayPanel: creé el listEl e inserté después del box', box);
+    }
+
+    const placeholderBox = listEl.__placeholderBox;
+    listEl.innerHTML = '';
+    if (dayList.length > 0) {
+      if (placeholderBox) placeholderBox.style.setProperty('display', 'none', 'important');
+      dayList.forEach((ev) => {
+        const row = document.createElement('div');
+        Object.assign(row.style, {
+          display: 'flex', alignItems: 'center', gap: '8px', padding: '8px 10px',
+          border: '1px solid #eee', borderRadius: '8px', fontSize: '16px',
+          fontFamily: 'Arial, sans-serif', color: '#111', background: '#fff',
+        });
+        const dot = document.createElement('span');
+        Object.assign(dot.style, { width: '10px', height: '10px', borderRadius: '50%', background: ev.color, flexShrink: '0' });
+        const label = document.createElement('span');
+        label.textContent = ev.materia ? `${ev.materia}: ${ev.text}` : ev.text;
+        row.appendChild(dot);
+        row.appendChild(label);
+        listEl.appendChild(row);
+      });
+    } else if (placeholderBox) {
+      placeholderBox.style.removeProperty('display');
+    }
+  }
+
+  function runAddon3() {
+    const container = findContainerByText('Calendario');
+    if (!container) return;
+    const header = parseMonthHeader(container);
+    if (!header) return;
+    const cells = getDayCells(container);
+    if (cells.length === 0) return;
+
+    const assigned = assignDatesToCells(cells, header.month, header.year);
+    const events = loadCalEvents();
+
+    assigned.forEach(({ cell, date }) => {
+      const key = dateKey(date);
+      // guardamos la fecha/key ACTUALES directamente en la celda. Es clave porque
+      // D2L reutiliza los mismos elementos del DOM al cambiar de mes (les cambia el
+      // número que muestran en vez de crear celdas nuevas) — si el click leyera la
+      // fecha de una variable capturada en el momento del primer bind, quedaría
+      // "pegado" a la fecha vieja para siempre en esa celda.
+      cell.__eafitDate = date;
+      cell.__eafitKey = key;
+
+      const dayEvents = events[key]; // array o undefined
+      if (dayEvents && dayEvents.length > 0) {
+        const colors = dayEvents.map((e) => e.color);
+        if (colors.length === 1) {
+          cell.style.setProperty('background', colors[0], 'important');
+        } else {
+          // varios eventos el mismo día: partimos el círculo en gajos iguales,
+          // uno por color, en vez de tapar todo con un solo color
+          const step = 100 / colors.length;
+          const stops = colors.map((c, i) => `${c} ${i * step}% ${(i + 1) * step}%`).join(', ');
+          cell.style.setProperty('background', `conic-gradient(${stops})`, 'important');
+        }
+        cell.style.setProperty('color', '#fff', 'important');
+        cell.style.setProperty('border-radius', '50%', 'important');
+        cell.title = dayEvents.map((e) => (e.materia ? `${e.materia}: ${e.text}` : e.text)).join(' • ');
+      } else {
+        // esto es lo que faltaba: si esta celda NO tiene evento para la fecha que
+        // representa ahora, hay que LIMPIAR cualquier color que le hayamos puesto
+        // antes (cuando era una fecha distinta, de otro mes)
+        cell.style.removeProperty('background');
+        cell.style.removeProperty('color');
+        cell.style.removeProperty('border-radius');
+        cell.title = '';
+      }
+
+      if (!cell.dataset.eafitCalBound) {
+        cell.dataset.eafitCalBound = '1';
+        cell.style.cursor = 'pointer';
+        cell.style.userSelect = 'none';
+
+        let pressTimer = null;
+        let longPressFired = false;
+
+        const openModalForCell = () => {
+          const evs = loadCalEvents();
+          const currentDate = cell.__eafitDate;
+          const currentKey = cell.__eafitKey;
+          const dayList = evs[currentKey] || [];
+
+          const addNewEvent = () => {
+            openEventModal(currentDate, null, (text, color, materia) => {
+              const all = loadCalEvents();
+              const arr = all[currentKey] || [];
+              arr.push({ text, color, materia: materia || undefined });
+              all[currentKey] = arr;
+              saveCalEvents(all);
+              if (materia) {
+                const colors = loadCourseColors();
+                colors[materia] = color;
+                saveCourseColors(colors);
+              }
+              runAddon3();
+            }, null);
+          };
+
+          if (dayList.length === 0) {
+            addNewEvent();
+            return;
+          }
+
+          openDayEventsList(currentDate, currentKey, dayList, addNewEvent);
+        };
+
+        // mantener pulsado (~550ms) abre el modal; soltar antes de eso es un click
+        // normal, que solo selecciona el día (nada más)
+        const startPress = () => {
+          longPressFired = false;
+          pressTimer = setTimeout(() => {
+            longPressFired = true;
+            openModalForCell();
+          }, 550);
+        };
+        const cancelPress = () => {
+          if (pressTimer) {
+            clearTimeout(pressTimer);
+            pressTimer = null;
+          }
+        };
+        const endPress = (e) => {
+          cancelPress();
+          if (longPressFired) {
+            e.preventDefault();
+            return; // el modal ya se abrió, no hacemos nada más
+          }
+          // click corto: solo seleccionar visualmente
+          const prevs = deepQueryAll(container, '.eafit-cal-selected');
+          prevs.forEach((el) => {
+            el.classList.remove('eafit-cal-selected');
+            el.style.removeProperty('outline');
+            el.style.removeProperty('outline-offset');
+          });
+          const evs = loadCalEvents();
+          if (!evs[cell.__eafitKey] || evs[cell.__eafitKey].length === 0) {
+            cell.style.setProperty('outline', '2px solid #0a84ff', 'important');
+            cell.style.setProperty('outline-offset', '2px', 'important');
+          }
+          cell.classList.add('eafit-cal-selected');
+        };
+
+        cell.addEventListener('mousedown', startPress);
+        cell.addEventListener('mouseup', endPress);
+        cell.addEventListener('mouseleave', cancelPress);
+        cell.addEventListener('touchstart', startPress, { passive: true });
+        cell.addEventListener('touchend', endPress);
+        cell.addEventListener('touchcancel', cancelPress);
+        cell.addEventListener('contextmenu', (e) => e.preventDefault());
+      }
+    });
+
+    renderSelectedDayPanel();
+  }
+
+  runAddon3();
+  setInterval(runAddon3, 1500); // re-detecta si D2L re-renderiza el widget o cambiás de mes
+})();

@@ -1,0 +1,296 @@
+// ==UserScript==
+// @name         EAFIT D2L - Tema Liquid Glass
+// @namespace    http://tampermonkey.net/
+// @version      1.0.0
+// @description  Reviste el D2L de EAFIT con estética liquid glass: fondo blanco, tarjetas de vidrio esmerilado con blur real, texto negro, blobs de color flotando muy sutiles. Solo visual, no toca funcionalidad.
+// @author       You
+// @match        https://interactivavirtual.eafit.edu.co/*
+// @grant        none
+// @run-at       document-start
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  // ---------- 1. Tipografía limpia + colores base ----------
+
+  const fontLink = document.createElement('link');
+  fontLink.rel = 'stylesheet';
+  fontLink.href = 'https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap';
+  document.head.appendChild(fontLink);
+
+  const style = document.createElement('style');
+  style.textContent = `
+    :root {
+      --glass-bg: rgba(255,255,255,.68);
+      --glass-bg-strong: rgba(255,255,255,.8);
+      --glass-border: rgba(255,255,255,.8);
+      --glass-shadow: rgba(31,38,135,.14);
+      --glass-text: #0a0a0a;
+      --glass-accent: #0a84ff;
+    }
+
+    /* ===== tipografía limpia, texto negro en todos lados ===== */
+    body, body * :not(iframe):not(svg):not(path) {
+      font-family: 'Inter', 'Segoe UI', sans-serif !important;
+      color: var(--glass-text) !important;
+    }
+    h1, h2, h3, h4, .d2l-heading-1, .d2l-heading-2, .d2l-heading-3, .d2l-heading-4 {
+      font-weight: 700 !important;
+      color: var(--glass-text) !important;
+    }
+
+    /* ===== fondo blanco limpio ===== */
+    html, body {
+      background: #f5f7fa !important;
+    }
+
+    /* blobs de color muy suaves flotando detrás de todo, para que se sienta "liquid" */
+    #glass-blob-layer {
+      position: fixed;
+      inset: 0;
+      z-index: -1;
+      overflow: hidden;
+      pointer-events: none;
+    }
+    .glass-blob {
+      position: absolute;
+      border-radius: 50%;
+      filter: blur(60px);
+      opacity: .35;
+      animation: glassDrift 26s ease-in-out infinite;
+    }
+    @keyframes glassDrift {
+      0%   { transform: translate(0,0) scale(1); }
+      33%  { transform: translate(4vw, 3vh) scale(1.1); }
+      66%  { transform: translate(-3vw, -2vh) scale(.95); }
+      100% { transform: translate(0,0) scale(1); }
+    }
+
+    /* enlaces */
+    a { color: var(--glass-accent) !important; }
+    a:hover { text-decoration: underline !important; }
+
+    /* ===== glassmorphism en tarjetas/paneles reales, sin comodines genéricos
+       que agarren contenedores anidados (eso generaba cajas dentro de cajas) ===== */
+    .d2l-card, .d2l-panel-body, .d2l-tile, [class$="Card"], [class$="Tile"] {
+      position: relative;
+      background: var(--glass-bg) !important;
+      backdrop-filter: blur(32px) saturate(110%) !important;
+      -webkit-backdrop-filter: blur(32px) saturate(110%) !important;
+      border: 1px solid var(--glass-border) !important;
+      border-radius: 20px !important;
+      box-shadow: 0 8px 32px var(--glass-shadow) !important;
+      overflow: hidden !important;
+    }
+    /* brillo superior simulando el reflejo del vidrio */
+    .d2l-card::before, .d2l-panel-body::before, .d2l-tile::before,
+    [class$="Card"]::before, [class$="Tile"]::before {
+      content: "";
+      position: absolute;
+      top: 0; left: 0; right: 0;
+      height: 40%;
+      background: linear-gradient(180deg, rgba(255,255,255,.5) 0%, rgba(255,255,255,0) 100%);
+      pointer-events: none;
+    }
+
+    /* botones: pill de vidrio */
+    button, .d2l-button, a.d2l-button, [role="button"] {
+      border-radius: 999px !important;
+      background: var(--glass-bg-strong) !important;
+      backdrop-filter: blur(20px) !important;
+      -webkit-backdrop-filter: blur(20px) !important;
+      border: 1px solid var(--glass-border) !important;
+      color: var(--glass-text) !important;
+      box-shadow: 0 2px 10px rgba(31,38,135,.10) !important;
+      transition: box-shadow .15s ease, transform .1s ease !important;
+    }
+    button:hover, .d2l-button:hover, a.d2l-button:hover, [role="button"]:hover {
+      box-shadow: 0 6px 18px rgba(31,38,135,.18) !important;
+      transform: translateY(-1px) !important;
+    }
+
+    /* barras de progreso */
+    .d2l-meter-bar, progress, [class*="progress"] {
+      accent-color: var(--glass-accent) !important;
+    }
+
+    /* inputs: también vidrio */
+    input, textarea, select {
+      background: var(--glass-bg-strong) !important;
+      backdrop-filter: blur(16px) !important;
+      -webkit-backdrop-filter: blur(16px) !important;
+      border: 1px solid var(--glass-border) !important;
+      border-radius: 12px !important;
+      color: var(--glass-text) !important;
+    }
+
+    /* scrollbar */
+    ::-webkit-scrollbar { width: 12px; height: 12px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb {
+      background: rgba(10,132,255,.35);
+      border-radius: 10px;
+      border: 3px solid transparent;
+      background-clip: padding-box;
+    }
+    * { scrollbar-color: rgba(10,132,255,.35) transparent; }
+
+    /* selección de texto */
+    ::selection { background: rgba(10,132,255,.25); color: var(--glass-text); }
+
+    /* ===== foto de perfil: circular con borde de vidrio, en vez del cuadrado feo ===== */
+    header img, nav img,
+    img[class*="avatar" i], img[class*="Avatar"],
+    img[class*="profile" i], img[class*="Profile"],
+    [class*="avatar" i] img, [class*="Avatar"] img,
+    [class*="profile" i] img, [class*="Profile"] img {
+      border-radius: 50% !important;
+      border: 2px solid rgba(255,255,255,.85) !important;
+      box-shadow: 0 2px 10px rgba(31,38,135,.20) !important;
+      object-fit: cover !important;
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      .glass-blob { animation: none !important; }
+    }
+  `;
+  document.head.appendChild(style);
+
+  // ---------- 1b. Corrector de contraste automático ----------
+  // En vez de adivinar el nombre de clase exacto de la barra negra de D2L,
+  // calculamos el color de fondo REAL detrás de cada texto (subiendo por los
+  // ancestros hasta encontrar uno no-transparente) y si es oscuro, forzamos
+  // el texto a blanco. Así funciona sin importar cómo se llame ese elemento.
+
+  function parseRGBA(str) {
+    const m = str.match(/rgba?\(([^)]+)\)/);
+    if (!m) return null;
+    const parts = m[1].split(',').map((s) => parseFloat(s.trim()));
+    return { r: parts[0], g: parts[1], b: parts[2], a: parts.length > 3 ? parts[3] : 1 };
+  }
+
+  function getEffectiveBackground(el) {
+    let node = el;
+    while (node && node !== document.documentElement) {
+      const bg = getComputedStyle(node).backgroundColor;
+      const rgba = parseRGBA(bg);
+      if (rgba && rgba.a > 0.3) return rgba;
+      node = node.parentElement;
+    }
+    return { r: 255, g: 255, b: 255, a: 1 }; // asumimos fondo blanco por defecto
+  }
+
+  function luminance({ r, g, b }) {
+    return 0.299 * r + 0.587 * g + 0.114 * b;
+  }
+
+  function fixContrast() {
+    const all = document.querySelectorAll('a, span, div, p, li, h1, h2, h3, h4, h5, h6, button, label');
+    all.forEach((el) => {
+      // el modal de eventos del script de utilidades (calendario) tiene sus propios
+      // colores intencionales (ej. el azul de "Guardar") — sin este chequeo, el
+      // corrector de contraste veía ese azul, calculaba una luminosidad baja, y le
+      // borraba el fondo pensando que estaba "arreglando" un botón en una barra
+      // oscura, cuando en realidad era nuestro propio botón.
+      if (el.closest && el.closest('#eafit-cal-modal')) return;
+
+      // solo nos interesan nodos que tengan texto propio (no solo hijos con texto)
+      const hasOwnText = Array.from(el.childNodes).some(
+        (n) => n.nodeType === Node.TEXT_NODE && n.textContent.trim().length > 0
+      );
+      if (!hasOwnText) return;
+      const bg = getEffectiveBackground(el);
+      if (luminance(bg) < 120) {
+        el.style.setProperty('color', '#ffffff', 'important');
+
+        // si además es uno de los botones que nuestro propio CSS convirtió en
+        // "píldora de vidrio" (el recuadro feo en Calificaciones/Evaluaciones/
+        // Comunicaciones), le sacamos ese fondo/borde para que quede como texto
+        // plano, igual que Inicio/Contenido que no tienen recuadro
+        if (el.matches('button, .d2l-button, a.d2l-button, [role="button"]')) {
+          el.style.setProperty('background', 'transparent', 'important');
+          el.style.setProperty('border', 'none', 'important');
+          el.style.setProperty('box-shadow', 'none', 'important');
+          el.style.setProperty('backdrop-filter', 'none', 'important');
+        }
+      }
+    });
+  }
+
+  // corre al cargar, y de nuevo (con throttle) cuando D2L cambia el DOM por navegación SPA
+  let contrastTimer = null;
+  function scheduleContrastFix() {
+    clearTimeout(contrastTimer);
+    contrastTimer = setTimeout(() => {
+      fixContrast();
+      stripPillOnDarkBars();
+    }, 400);
+  }
+  window.addEventListener('load', scheduleContrastFix);
+  scheduleContrastFix();
+  new MutationObserver(scheduleContrastFix).observe(document.documentElement, {
+    childList: true,
+    subtree: true,
+  });
+
+  // ---------- 1c. Sacar el recuadro de vidrio a los botones que viven en la barra negra ----------
+  // fixContrast() mira el fondo del propio botón para decidir si está sobre algo oscuro,
+  // pero nuestro CSS ya le puso un fondo clarito de vidrio a TODOS los botones — así que
+  // el botón nunca "ve" la barra negra detrás suyo. Acá miramos el fondo del PADRE del
+  // botón en cambio, que sí revela si está parado sobre la barra negra.
+
+  function stripPillOnDarkBars() {
+    const buttons = document.querySelectorAll('button, .d2l-button, a.d2l-button, [role="button"]');
+    buttons.forEach((btn) => {
+      if (btn.closest && btn.closest('#eafit-cal-modal')) return; // no tocar el modal del calendario
+      if (!btn.parentElement) return;
+      const bg = getEffectiveBackground(btn.parentElement);
+      if (luminance(bg) < 120) {
+        btn.style.setProperty('background', 'transparent', 'important');
+        btn.style.setProperty('border', 'none', 'important');
+        btn.style.setProperty('box-shadow', 'none', 'important');
+        btn.style.setProperty('backdrop-filter', 'none', 'important');
+        btn.style.setProperty('color', '#ffffff', 'important');
+        // el texto suele venir en un <span> adentro del botón, no como texto directo
+        btn.querySelectorAll('*').forEach((child) => {
+          child.style.setProperty('color', '#ffffff', 'important');
+        });
+      }
+    });
+  }
+
+  // ---------- 2. Capa de blobs de fondo, muy sutil ----------
+
+  function buildDecor() {
+    if (document.getElementById('glass-blob-layer')) return;
+
+    const layer = document.createElement('div');
+    layer.id = 'glass-blob-layer';
+    document.body.appendChild(layer);
+
+    const blobs = [
+      { color: '#a7c7ff', size: 420, top: '-8%', left: '5%', delay: '0s' },
+      { color: '#ffd6e8', size: 380, top: '20%', left: '70%', delay: '-8s' },
+      { color: '#c9f7e0', size: 460, top: '60%', left: '15%', delay: '-16s' },
+      { color: '#fff2b8', size: 340, top: '75%', left: '75%', delay: '-4s' },
+    ];
+    blobs.forEach((b) => {
+      const el = document.createElement('div');
+      el.className = 'glass-blob';
+      el.style.width = b.size + 'px';
+      el.style.height = b.size + 'px';
+      el.style.top = b.top;
+      el.style.left = b.left;
+      el.style.background = b.color;
+      el.style.animationDelay = b.delay;
+      layer.appendChild(el);
+    });
+  }
+
+  if (document.body) {
+    buildDecor();
+  } else {
+    document.addEventListener('DOMContentLoaded', buildDecor);
+  }
+})();
