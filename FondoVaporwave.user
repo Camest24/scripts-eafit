@@ -263,6 +263,76 @@
   // 2. cualquier TEXTO (no solo íconos) que esté flotando directo sobre
   // nuestro fondo (sin ningún ancestro con fondo opaco) también lo pintamos
   // blanco — esto agarra tu nombre, y cualquier otro texto suelto ahí arriba
+  // ¿este elemento es un ÍCONO dibujado como background-image? D2L no dibuja
+  // todos los íconos con <svg>: varios son un elemento chico con
+  // "background-image: url(.../tier1/algo.svg)" (se ve en el CSS propio de D2L).
+  // A esos el fill/color no les hace absolutamente nada — hay que invertirlos con
+  // un filtro. Por eso, dentro de un mismo ítem de la lista de "Contenido", el
+  // check de "Completado" (que sí es <svg>) salía blanco y el ícono de documento
+  // seguía negro.
+  function isGlyphIcon(el) {
+    const rect = el.getBoundingClientRect();
+    if (rect.width < 6 || rect.width > 40 || rect.height < 6 || rect.height > 40) return false;
+    // caso A: un <img> que apunta a un .svg. OJO con el filtro de extensión: sin
+    // él, esto agarraría también tu foto de perfil (es un <img> chico en la barra)
+    // y la dejaría en blanco puro. Los íconos son .svg; avatares y logo son
+    // .jpg/.png, así que la extensión alcanza para separarlos.
+    if (el.tagName === 'IMG') {
+      return /\.svg(\?|$)/i.test(el.getAttribute('src') || '');
+    }
+    // caso B: un elemento chico cuyo ícono es su background-image
+    const bgImage = getComputedStyle(el).backgroundImage;
+    return !!bgImage && bgImage !== 'none' && bgImage.includes('url(');
+  }
+
+  // aplica el contraste a UN elemento. Devuelve qué rama se tomó, para poder
+  // contar y para reusar esta misma lógica desde el manejo del hover.
+  function applyContrastTo(el) {
+    const isLeaf = el.children.length === 0;
+    if (!isLeaf) return null;
+    const text = el.textContent && el.textContent.trim();
+    const glyph = !text && isGlyphIcon(el);
+    if (!text && !glyph) return null;
+
+    if (hasFloatingMenuAncestor(el)) {
+      if (el.dataset.eafitTextWhitened) {
+        el.style.removeProperty('color');
+        delete el.dataset.eafitTextWhitened;
+      }
+      if (el.dataset.eafitGlyphWhitened) {
+        el.style.removeProperty('filter');
+        delete el.dataset.eafitGlyphWhitened;
+      }
+      return 'menu';
+    }
+
+    const bg = findsOpaqueAncestorBg(el);
+    if (bg === null) {
+      if (glyph) {
+        // brightness(0) lo vuelve negro puro y invert(1) lo pasa a blanco puro:
+        // funciona con cualquier .svg oscuro sin saber su color original
+        el.style.setProperty('filter', 'brightness(0) invert(1)', 'important');
+        el.dataset.eafitGlyphWhitened = '1';
+      } else {
+        el.style.setProperty('color', '#fff', 'important');
+        el.dataset.eafitTextWhitened = '1';
+      }
+      return 'pintado';
+    }
+
+    // hay un fondo opaco real detrás (ej. el fondo blanco que D2L le pone al ítem
+    // bajo el mouse) — revertimos lo nuestro para no dejar blanco sobre blanco
+    if (el.dataset.eafitTextWhitened) {
+      el.style.removeProperty('color');
+      delete el.dataset.eafitTextWhitened;
+    }
+    if (el.dataset.eafitGlyphWhitened) {
+      el.style.removeProperty('filter');
+      delete el.dataset.eafitGlyphWhitened;
+    }
+    return 'fondoPropio';
+  }
+
   let lastTextSummary = '';
   let textDiagnosticLogsLeft = 10;
   function whitenTextOverBackground() {
@@ -271,31 +341,10 @@
     let saltadosPorFondoPropio = 0;
 
     deepQuerySelectorAll(document, '*').forEach((el) => {
-      if (el.children.length !== 0) return; // solo hojas de texto puro
-      const text = el.textContent && el.textContent.trim();
-      if (!text) return;
-      if (hasFloatingMenuAncestor(el)) {
-        saltadosPorMenu++;
-        if (el.dataset.eafitTextWhitened) {
-          el.style.removeProperty('color');
-          delete el.dataset.eafitTextWhitened;
-        }
-        return;
-      }
-      const bg = findsOpaqueAncestorBg(el);
-      if (bg === null) {
-        pintados++;
-        el.style.setProperty('color', '#fff', 'important');
-        el.dataset.eafitTextWhitened = '1';
-      } else {
-        saltadosPorFondoPropio++;
-        if (el.dataset.eafitTextWhitened) {
-          // mismo caso: apareció un fondo opaco real (ej. un menú desplegable
-          // que recién terminó de asentar su fondo) — revertimos el blanco
-          el.style.removeProperty('color');
-          delete el.dataset.eafitTextWhitened;
-        }
-      }
+      const resultado = applyContrastTo(el);
+      if (resultado === 'pintado') pintados++;
+      else if (resultado === 'menu') saltadosPorMenu++;
+      else if (resultado === 'fondoPropio') saltadosPorFondoPropio++;
     });
 
     // si algún texto vuelve a quedar ilegible, este resumen dice de una cuál de
@@ -508,6 +557,43 @@
     });
   });
   wrapperObserver.observe(document.documentElement, { childList: true, subtree: true });
+
+  // BUG (el ítem se ponía blanco al pasarle el mouse): pasar el mouse NO es una
+  // mutación del DOM, es solo un :hover de CSS. Cuando D2L le pinta fondo blanco
+  // al ítem bajo el cursor, el MutationObserver no se entera, así que el texto
+  // que habíamos pintado blanco se quedaba blanco SOBRE blanco (invisible).
+  // La lógica para revertirlo ya existía en applyContrastTo(), solo que nunca se
+  // volvía a ejecutar. Acá la disparamos con el mouse — pero re-evaluando SOLO la
+  // zona bajo el cursor, no toda la página: mouseover dispara muchísimo y un
+  // barrido completo en cada movimiento haría lagear el navegador.
+  let hoverRaf = false;
+  let hoverTarget = null;
+  function scheduleHoverRefresh(e) {
+    hoverTarget = e.target;
+    if (hoverRaf) return;
+    hoverRaf = true;
+    requestAnimationFrame(() => {
+      hoverRaf = false;
+      if (!hoverTarget || hoverTarget.nodeType !== 1) return;
+      // subimos unos niveles antes de re-evaluar: el fondo del hover suele estar
+      // en un contenedor padre, y sus hermanos (ej. el "Completado" de abajo)
+      // también hay que recalcularlos, no solo el nodo exacto bajo el cursor
+      let scope = hoverTarget;
+      for (let i = 0; i < 4; i++) {
+        const parent = getParentAcrossShadow(scope);
+        if (!parent) break;
+        // no subir hasta contenedores enormes: re-escanearlos en cada movimiento
+        // del mouse sería caro. Con el ítem/tarjeta bajo el cursor alcanza.
+        const rect = parent.getBoundingClientRect();
+        if (rect.height > 400 || rect.width > window.innerWidth * 0.8) break;
+        scope = parent;
+      }
+      applyContrastTo(scope);
+      deepQuerySelectorAll(scope, '*').forEach(applyContrastTo);
+    });
+  }
+  document.addEventListener('mouseover', scheduleHoverRefresh, true);
+  document.addEventListener('mouseout', scheduleHoverRefresh, true);
 
   if (document.body) {
     injectBackground();
